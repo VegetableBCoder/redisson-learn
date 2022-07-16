@@ -1,12 +1,12 @@
 /**
  * Copyright (c) 2013-2021 Nikita Koksharov
- *
+ * <p>
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,14 +15,16 @@
  */
 package org.redisson.pubsub;
 
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 
  * @author Nikita Koksharov
- *
  */
 public class AsyncSemaphore {
 
@@ -30,9 +32,10 @@ public class AsyncSemaphore {
     private final Queue<CompletableFuture<Void>> listeners = new ConcurrentLinkedQueue<>();
 
     public AsyncSemaphore(int permits) {
+        // 设置初始值
         counter = new AtomicInteger(permits);
     }
-    
+
     public boolean tryAcquire(long timeoutMillis) {
         CompletableFuture<Void> f = acquire();
         try {
@@ -51,7 +54,7 @@ public class AsyncSemaphore {
     public int queueSize() {
         return listeners.size();
     }
-    
+
     public void removeListeners() {
         listeners.clear();
     }
@@ -69,8 +72,11 @@ public class AsyncSemaphore {
 
     private void tryRun() {
         while (true) {
+            //--后还是>=0
             if (counter.decrementAndGet() >= 0) {
+                // 从队列取出listener
                 CompletableFuture<Void> future = listeners.poll();
+                // 是null重新加回去
                 if (future == null) {
                     counter.incrementAndGet();
                     return;
@@ -80,7 +86,7 @@ public class AsyncSemaphore {
                     return;
                 }
             }
-
+            // <=0 就结束循环
             if (counter.incrementAndGet() <= 0) {
                 return;
             }
@@ -100,7 +106,22 @@ public class AsyncSemaphore {
     public String toString() {
         return "value:" + counter + ":queue:" + queueSize();
     }
-    
-    
-    
+
+    public static void main(String[] args) {
+        // 两个资源
+        AsyncSemaphore semaphore = new AsyncSemaphore(2);
+        for (int i = 0; i < 3; i++) {
+            final int finalI = i;
+            Thread thread = new Thread(() -> semaphore.acquire(() -> {
+                System.out.println(finalI);
+                try {
+                    Thread.sleep(2 * 1000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                semaphore.release();
+            }));
+            thread.start();
+        }
+    }
 }
