@@ -78,6 +78,7 @@ public class BaseTransactionalMap<K, V> extends BaseTransactionalObject {
     
     private final long timeout;
     final List<TransactionalOperation> operations;
+    //这个state记录干嘛的
     final Map<HashValue, MapEntry> state = new HashMap<>();
     final RMap<K, V> map;
     final CommandAsyncExecutor commandExecutor;

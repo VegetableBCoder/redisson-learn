@@ -103,11 +103,15 @@ public class RedissonDelayedQueue<V> extends RedissonExpirable implements RDelay
      
         long randomId = ThreadLocalRandom.current().nextLong();
         return commandExecutor.evalWriteNoRetryAsync(getRawName(), codec, RedisCommands.EVAL_VOID,
-                "local value = struct.pack('dLc0', tonumber(ARGV[2]), string.len(ARGV[3]), ARGV[3]);" 
+                // 把延迟时间点和value拼到一起
+                "local value = struct.pack('dLc0', tonumber(ARGV[2]), string.len(ARGV[3]), ARGV[3]);"
+                // 加到超时判断集合中去
+                // 加到队列右边去(是带delay前缀的不是真实的队列)
               + "redis.call('zadd', KEYS[2], ARGV[1], value);"
               + "redis.call('rpush', KEYS[3], value);"
               // if new object added to queue head when publish its startTime 
-              // to all scheduler workers 
+              // to all scheduler workers
+                //  如果这个元素被加到了队头 通过publish 发布它的超时时间到channel
               + "local v = redis.call('zrange', KEYS[2], 0, 0); "
               + "if v[1] == value then "
                  + "redis.call('publish', KEYS[4], ARGV[1]); "

@@ -114,8 +114,7 @@ public final class TransactionOptions {
     }
 
     /**
-     * Synchronize write operations execution within defined timeout
-     * across specified amount of Redis slave nodes.
+     * Synchronize write operations execution within defined timeout across specified amount of Redis slave nodes.
      * <p>
      * Default slaves value is <code>0</code> which means available slaves
      * at the moment of execution and <code>-1</code> means no sync at all.
