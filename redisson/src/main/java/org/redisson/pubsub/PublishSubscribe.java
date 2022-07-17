@@ -34,6 +34,7 @@ import java.util.concurrent.ConcurrentMap;
 abstract class PublishSubscribe<E extends PubSubEntry<E>> {
 
     private final ConcurrentMap<String, E> entries = new ConcurrentHashMap<>();
+    // 实际的操作
     private final PublishSubscribeService service;
 
     PublishSubscribe(PublishSubscribeService service) {
@@ -42,10 +43,12 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
     }
 
     public void unsubscribe(E entry, String entryName, String channelName) {
+        //实际是根据hash拿的锁信息
         AsyncSemaphore semaphore = service.getSemaphore(new ChannelName(channelName));
         semaphore.acquire(() -> {
             if (entry.release() == 0) {
                 entries.remove(entryName);
+                //调用 PublishSubscribeService 进行操作
                 service.unsubscribe(PubSubType.UNSUBSCRIBE, new ChannelName(channelName))
                         .whenComplete((r, e) -> {
                             semaphore.release();
@@ -76,6 +79,7 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
             }
 
             E entry = entries.get(entryName);
+            // 如果已经有订阅记录了
             if (entry != null) {
                 entry.acquire();
                 semaphore.release();
@@ -88,10 +92,10 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
                 });
                 return;
             }
-
+            // create
             E value = createEntry(newPromise);
             value.acquire();
-
+            // 线程安全考虑 如果有并发subscribe oldValue就是别的了
             E oldValue = entries.putIfAbsent(entryName, value);
             if (oldValue != null) {
                 oldValue.acquire();
@@ -106,6 +110,7 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
                 return;
             }
 
+            // 创建监听器
             RedisPubSubListener<Object> listener = createListener(channelName, value);
             CompletableFuture<PubSubConnectionEntry> s = service.subscribeNoTimeout(LongCodec.INSTANCE, channelName, semaphore, listener);
             newPromise.whenComplete((r, e) -> {
@@ -138,7 +143,7 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
                 if (!channelName.equals(channel.toString())) {
                     return;
                 }
-
+                //按实现类执行onMessage
                 PublishSubscribe.this.onMessage(value, (Long) message);
             }
         };

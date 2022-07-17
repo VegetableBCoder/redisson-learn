@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 信号量
+ *
  * @author Nikita Koksharov
  */
 public class AsyncSemaphore {
@@ -63,6 +64,7 @@ public class AsyncSemaphore {
     public CompletableFuture<Void> acquire() {
         CompletableFuture<Void> future = new CompletableFuture<>();
         listeners.add(future);
+        //传进去的future刚new出来的 complete一定会true(只有这里会 add future 只有里面会poll future)
         tryRun();
         return future;
     }
@@ -73,10 +75,11 @@ public class AsyncSemaphore {
     }
 
     private void tryRun() {
+        // 自旋...
         while (true) {
             //--后还是>=0
             if (counter.decrementAndGet() >= 0) {
-                // 从队列取出listener
+                // 从队列取出
                 CompletableFuture<Void> future = listeners.poll();
                 // 是null重新加回去
                 if (future == null) {
@@ -109,22 +112,22 @@ public class AsyncSemaphore {
         return "value:" + counter + ":queue:" + queueSize();
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
         // 两个资源
-        AsyncSemaphore semaphore = new AsyncSemaphore(2);
+        AsyncSemaphore semaphore = new AsyncSemaphore(1);
         for (int i = 0; i < 3; i++) {
             final int finalI = i;
-            // 争抢
-            Thread thread = new Thread(() -> semaphore.acquire(() -> {
-                System.out.println(finalI);
+            CompletableFuture.runAsync(() -> semaphore.acquire(() -> {
+                System.out.println("task " + finalI + " get resource at " + System.currentTimeMillis() / 1000);
                 try {
                     Thread.sleep(2 * 1000);
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
+                System.out.println("task " + finalI + " release resource at " + System.currentTimeMillis() / 1000);
                 semaphore.release();
             }));
-            thread.start();
         }
+        Thread.sleep(4000);
     }
 }

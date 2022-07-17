@@ -103,9 +103,11 @@ public class RedissonLock extends RedissonBaseLock {
 
         //订阅锁释放的事件
         CompletableFuture<RedissonLockEntry> future = subscribe(threadId);
+        //等过期
         pubSub.timeout(future);
         RedissonLockEntry entry;
         if (interruptibly) {
+            //如果是被中断则获取中断原因
             entry = commandExecutor.getInterrupted(future);
         } else {
             entry = commandExecutor.get(future);
@@ -113,8 +115,10 @@ public class RedissonLock extends RedissonBaseLock {
 
         try {
             while (true) {
+                // ttl不为null是其他拥有者持有的过期时间
                 ttl = tryAcquire(-1, leaseTime, unit, threadId);
                 // lock acquired
+                // 锁已经拿到了
                 if (ttl == null) {
                     break;
                 }
@@ -122,14 +126,18 @@ public class RedissonLock extends RedissonBaseLock {
                 // waiting for message
                 if (ttl >= 0) {
                     try {
+                        // 等待 最多到超时位置
                         entry.getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                     } catch (InterruptedException e) {
                         if (interruptibly) {
                             throw e;
                         }
+                        // 等待被中断了 也进行尝试
                         entry.getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                     }
-                } else {
+                }
+                // 返回的ttl < 0  过期的key
+                else {
                     if (interruptibly) {
                         entry.getLatch().acquire();
                     } else {
@@ -138,6 +146,7 @@ public class RedissonLock extends RedissonBaseLock {
                 }
             }
         } finally {
+            //最终把订阅去掉
             unsubscribe(entry, threadId);
         }
 //        get(lockAsync(leaseTime, unit));
@@ -178,6 +187,7 @@ public class RedissonLock extends RedissonBaseLock {
 
     private <T> RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         RFuture<Long> ttlRemainingFuture;
+        //和上面一样
         if (leaseTime > 0) {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
         } else {
@@ -190,9 +200,11 @@ public class RedissonLock extends RedissonBaseLock {
                 if (leaseTime > 0) {
                     internalLockLeaseTime = unit.toMillis(leaseTime);
                 } else {
+                    // watchdog
                     scheduleExpirationRenewal(threadId);
                 }
             }
+            //返回的是剩余的ttl
             return ttlRemaining;
         });
         return new CompletableFutureWrapper<>(f);
@@ -235,6 +247,7 @@ public class RedissonLock extends RedissonBaseLock {
         long time = unit.toMillis(waitTime);
         long current = System.currentTimeMillis();
         long threadId = Thread.currentThread().getId();
+        //没拿到锁的返回了锁的ttl
         Long ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
@@ -242,16 +255,20 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         time -= System.currentTimeMillis() - current;
+        // 超时了
         if (time <= 0) {
             acquireFailed(waitTime, unit, threadId);
             return false;
         }
 
         current = System.currentTimeMillis();
+        // 订阅其他线程释放锁的消息
         CompletableFuture<RedissonLockEntry> subscribeFuture = subscribe(threadId);
         try {
             subscribeFuture.get(time, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
+        }
+        // 超时了
+        catch (TimeoutException e) {
             if (!subscribeFuture.cancel(false)) {
                 subscribeFuture.whenComplete((res, ex) -> {
                     if (ex == null) {
@@ -259,6 +276,7 @@ public class RedissonLock extends RedissonBaseLock {
                     }
                 });
             }
+
             acquireFailed(waitTime, unit, threadId);
             return false;
         } catch (ExecutionException e) {
@@ -267,21 +285,24 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         try {
+            // 剩余的等待时间
             time -= System.currentTimeMillis() - current;
             if (time <= 0) {
                 acquireFailed(waitTime, unit, threadId);
                 return false;
             }
-
+            //进行循环尝试
             while (true) {
                 long currentTime = System.currentTimeMillis();
+                // 获取
                 ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
-                // lock acquired
+                // lock acquired 拿到锁了
                 if (ttl == null) {
                     return true;
                 }
-
+                // 重新计算剩余时间
                 time -= System.currentTimeMillis() - currentTime;
+                // 超时
                 if (time <= 0) {
                     acquireFailed(waitTime, unit, threadId);
                     return false;
@@ -289,12 +310,16 @@ public class RedissonLock extends RedissonBaseLock {
 
                 // waiting for message
                 currentTime = System.currentTimeMillis();
+                // ttl -1, 如果key没有到期超时。  -2, 如果键不存在。
+                // ttl如果小于剩余时长
                 if (ttl >= 0 && ttl < time) {
+                    //等ttl到期再尝试 如果中间有收到订阅消息就被onMessage起来执行
                     commandExecutor.getNow(subscribeFuture).getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                 } else {
+                    //最多等到自己超时
                     commandExecutor.getNow(subscribeFuture).getLatch().tryAcquire(time, TimeUnit.MILLISECONDS);
                 }
-
+                // 剩余时间检查
                 time -= System.currentTimeMillis() - currentTime;
                 if (time <= 0) {
                     acquireFailed(waitTime, unit, threadId);
