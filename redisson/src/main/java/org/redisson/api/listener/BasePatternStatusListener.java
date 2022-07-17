@@ -24,6 +24,7 @@ package org.redisson.api.listener;
  */
 public class BasePatternStatusListener implements PatternStatusListener {
 
+    //空的 只在单元测试中用到了这个类 使用的时候自己去继承扩展(提供接口的默认实现)
     @Override
     public void onPSubscribe(String channel) {
     }

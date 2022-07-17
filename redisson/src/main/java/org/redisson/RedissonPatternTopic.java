@@ -74,6 +74,7 @@ public class RedissonPatternTopic implements RPatternTopic {
     }
 
     private int addListener(RedisPubSubListener<?> pubSubListener) {
+        // 发布订阅服务
         CompletableFuture<Collection<PubSubConnectionEntry>> future = subscribeService.psubscribe(channelName, codec, pubSubListener);
         commandExecutor.get(future);
         return System.identityHashCode(pubSubListener);

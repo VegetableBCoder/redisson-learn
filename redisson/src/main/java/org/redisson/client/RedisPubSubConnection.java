@@ -33,7 +33,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * 
+ *
  * @author Nikita Koksharov
  *
  */
@@ -58,12 +58,14 @@ public class RedisPubSubConnection extends RedisConnection {
     }
 
     public void onMessage(PubSubStatusMessage message) {
+        //遍历监听器 调用onStatus方法
         for (RedisPubSubListener<Object> redisPubSubListener : listeners) {
             redisPubSubListener.onStatus(message.getType(), message.getChannel());
         }
     }
 
     public void onMessage(PubSubMessage message) {
+        //遍历监听器 调用onMessage()
         for (RedisPubSubListener<Object> redisPubSubListener : listeners) {
             redisPubSubListener.onMessage(message.getChannel(), message.getValue());
         }
@@ -79,6 +81,7 @@ public class RedisPubSubConnection extends RedisConnection {
         for (ChannelName ch : channels) {
             this.channels.put(ch, codec);
         }
+        //执行订阅命令
         return async(new PubSubMessageDecoder(codec.getValueDecoder()), RedisCommands.SUBSCRIBE, channels);
     }
 
@@ -100,6 +103,7 @@ public class RedisPubSubConnection extends RedisConnection {
         RedisCommand<Object> command;
         if (type == PubSubType.UNSUBSCRIBE) {
             command = RedisCommands.UNSUBSCRIBE;
+            //取消订阅
             for (ChannelName ch : channels) {
                 this.channels.remove(ch);
                 unsubscribedChannels.put(ch, type);
@@ -107,11 +111,13 @@ public class RedisPubSubConnection extends RedisConnection {
         } else if (type == PubSubType.SUNSUBSCRIBE) {
             command = RedisCommands.SUNSUBSCRIBE;
             for (ChannelName ch : channels) {
+                // shard的
                 this.shardedChannels.remove(ch);
                 unsubscribedChannels.put(ch, type);
             }
         } else {
             command = RedisCommands.PUNSUBSCRIBE;
+            //pattern的
             for (ChannelName ch : channels) {
                 patternChannels.remove(ch);
                 unsubscribedChannels.put(ch, type);
@@ -129,18 +135,18 @@ public class RedisPubSubConnection extends RedisConnection {
         });
         return future;
     }
-    
+
     public void removeDisconnectListener(ChannelName channel) {
         unsubscribedChannels.remove(channel);
     }
-    
+
     @Override
     public void fireDisconnected() {
         super.fireDisconnected();
 
         unsubscribedChannels.forEach((key, value) -> onMessage(new PubSubStatusMessage(value, key)));
     }
-    
+
     private <T, R> ChannelFuture async(MultiDecoder<Object> messageDecoder, RedisCommand<T> command, Object... params) {
         CompletableFuture<R> promise = new CompletableFuture<>();
         return channel.writeAndFlush(new CommandData<>(promise, messageDecoder, null, command, params));

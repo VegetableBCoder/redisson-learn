@@ -77,6 +77,7 @@ public class PubSubConnectionEntry {
         if (queue == null) {
             queue = new ConcurrentLinkedQueue<RedisPubSubListener<?>>();
             Queue<RedisPubSubListener<?>> oldQueue = channelListeners.putIfAbsent(channelName, queue);
+            // 并发写入的
             if (oldQueue != null) {
                 queue = oldQueue;
             }
@@ -84,17 +85,22 @@ public class PubSubConnectionEntry {
 
         boolean deleted = false;
         synchronized (queue) {
+            // 如果拿出来的和队列里面的不是一个对象 synchronized之前的并发了 这里进行判断是避免线程安全问题
             if (channelListeners.get(channelName) != queue) {
+                //  标记为被删了
                 deleted = true;
             } else {
+                //加到队列尾部就好了
                 queue.add(listener);
             }
         }
         if (deleted) {
+            //重新调用自己 map中的队列对象(这次拿出来肯定不是null了)
             addListener(channelName, listener);
+            //避免重复往connection的listener中加
             return;
         }
-
+        //加到连接的监听器列表中
         conn.addListener(listener);
     }
 
@@ -102,6 +108,7 @@ public class PubSubConnectionEntry {
     public boolean removeListener(ChannelName channelName, EventListener msgListener) {
         Queue<RedisPubSubListener<?>> listeners = channelListeners.get(channelName);
         for (RedisPubSubListener<?> listener : listeners) {
+            // subscribe和psubcribe
             if (listener instanceof PubSubMessageListener) {
                 if (((PubSubMessageListener<?>) listener).getListener() == msgListener) {
                     removeListener(channelName, listener);
@@ -132,6 +139,7 @@ public class PubSubConnectionEntry {
     public void removeListener(ChannelName channelName, RedisPubSubListener<?> listener) {
         Queue<RedisPubSubListener<?>> queue = channelListeners.get(channelName);
         synchronized (queue) {
+            //没有监听器了 queue也不要了
             if (queue.remove(listener) && queue.isEmpty()) {
                 channelListeners.remove(channelName);
             }

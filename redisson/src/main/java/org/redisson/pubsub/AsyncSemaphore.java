@@ -24,6 +24,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
+ * 信号量
  * @author Nikita Koksharov
  */
 public class AsyncSemaphore {
@@ -67,6 +68,7 @@ public class AsyncSemaphore {
     }
 
     public void acquire(Runnable listener) {
+        // 获取资源到资源然后执行
         acquire().thenAccept(r -> listener.run());
     }
 
@@ -112,6 +114,7 @@ public class AsyncSemaphore {
         AsyncSemaphore semaphore = new AsyncSemaphore(2);
         for (int i = 0; i < 3; i++) {
             final int finalI = i;
+            // 争抢
             Thread thread = new Thread(() -> semaphore.acquire(() -> {
                 System.out.println(finalI);
                 try {
