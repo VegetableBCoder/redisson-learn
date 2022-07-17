@@ -209,10 +209,11 @@ public class PubSubConnectionEntry {
             public boolean onStatus(PubSubType type, CharSequence ch) {
                 if (type == commandType && channel.equals(ch)) {
                     executed.set(true);
-
+                    //移除监听器(自己这个)
                     conn.removeListener(this);
                     removeListeners(channel);
                     if (listener != null) {
+                        // 触发原来监听器的取消订阅事件
                         listener.onStatus(type, ch);
                     }
                     return true;
@@ -220,7 +221,7 @@ public class PubSubConnectionEntry {
                 return false;
             }
         });
-
+        // 调用取消订阅的
         ChannelFuture future = conn.unsubscribe(commandType, channel);
         future.addListener((ChannelFutureListener) f -> {
             if (!f.isSuccess()) {
@@ -231,6 +232,7 @@ public class PubSubConnectionEntry {
                 if (executed.get()) {
                     return;
                 }
+                //调用 onMessage
                 conn.onMessage(new PubSubStatusMessage(commandType, channel));
             }, connectionManager.getConfig().getTimeout(), TimeUnit.MILLISECONDS);
         });

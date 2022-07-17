@@ -176,7 +176,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                 // 创建续签任务
                 renewExpiration();
             } finally {
-                // 如果发生线程打断
+                // 如果发生线程中断
                 if (Thread.currentThread().isInterrupted()) {
                     // 取消续签
                     cancelExpirationRenewal(threadId);

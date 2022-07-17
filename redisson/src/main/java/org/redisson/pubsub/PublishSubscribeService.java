@@ -92,7 +92,7 @@ public class PublishSubscribeService {
     private final ConnectionManager connectionManager;
 
     private final MasterSlaveServersConfig config;
-
+    // 这些信号量的初始值都是1
     private final AsyncSemaphore[] locks = new AsyncSemaphore[50];
 
     private final AsyncSemaphore freePubSubLock = new AsyncSemaphore(1);
@@ -268,30 +268,32 @@ public class PublishSubscribeService {
             addListeners(channelName, promise, type, lock, connEntry, listeners);
             return;
         }
-
+        // semaphore是1
         freePubSubLock.acquire(() -> {
+            // subscribe的CF是isDone状态 归还锁定的资源
             if (promise.isDone()) {
                 lock.release();
                 freePubSubLock.release();
                 return;
             }
-
+            // 节点和连接
             MasterSlaveEntry msEntry = Optional.ofNullable(connectionManager.getEntry(entry.getClient())).orElse(entry);
             PubSubEntry freePubSubConnections = entry2PubSubConnection.getOrDefault(msEntry, new PubSubEntry());
 
             PubSubConnectionEntry freeEntry = freePubSubConnections.getEntries().peek();
             if (freeEntry == null) {
                 freePubSubLock.release();
-
+                //连接
                 CompletableFuture<RedisPubSubConnection> connectFuture = connect(codec, channelName, msEntry, promise, type, lock, listeners);
                 connectionManager.newTimeout(t -> {
+                    // 最多重试次数
                     if (attempts.get() == config.getRetryAttempts()) {
                         connectFuture.completeExceptionally(new RedisTimeoutException(
                             "Unable to acquire connection for subscription after " + attempts.get() + " attempts. " +
                                 "Increase 'subscriptionsPerConnection' and/or 'subscriptionConnectionPoolSize' parameters."));
                         return;
                     }
-
+                    // cancel了 重新调用 增加重试计数
                     if (connectFuture.cancel(true)) {
                         subscribe(codec, channelName, entry, promise, type, lock, attempts, listeners);
                         attempts.incrementAndGet();
@@ -300,30 +302,35 @@ public class PublishSubscribeService {
                 return;
             }
 
+            // tryAcquire 会锁定资源(原子操作)
             int remainFreeAmount = freeEntry.tryAcquire();
+            // 连接不允许再订阅了 (原子操作这里就没有用 <,>来进行边界判断 )
             if (remainFreeAmount == -1) {
                 throw new IllegalStateException();
             }
 
             PubSubKey key = new PubSubKey(channelName, msEntry);
+            //如果已经有并发的线程去连接订阅了 只要把自己的监听器也加上去就好了
             PubSubConnectionEntry oldEntry = name2PubSubConnection.putIfAbsent(key, freeEntry);
             if (oldEntry != null) {
+                //释放
                 freeEntry.release();
                 freePubSubLock.release();
-
+                //添加监听器就好了
                 addListeners(channelName, promise, type, lock, oldEntry, listeners);
                 return;
             }
-
+            // 如连接只剩下当前这一个了 poll拿掉队头元素
             if (remainFreeAmount == 0) {
                 freePubSubConnections.getEntries().poll();
             }
             freePubSubLock.release();
-
+            // 添加监听器
             CompletableFuture<Void> subscribeFuture = addListeners(channelName, promise, type, lock, freeEntry, listeners);
             freeEntry.subscribe(codec, type, channelName, subscribeFuture);
             subscribeFuture.whenComplete((r, e) -> {
                 if (e != null) {
+                    // 报错了取消订阅
                     unsubscribe(channelName, type);
                 }
             });
@@ -474,6 +481,7 @@ public class PublishSubscribeService {
     }
 
     private CompletableFuture<Codec> unsubscribe(ChannelName channelName, MasterSlaveEntry e, PubSubType topicType) {
+        //连接管理器都关了 说明连接销毁
         if (connectionManager.isShuttingDown()) {
             return CompletableFuture.completedFuture(null);
         }
@@ -482,12 +490,13 @@ public class PublishSubscribeService {
         AsyncSemaphore lock = getSemaphore(channelName);
         lock.acquire(() -> {
             PubSubConnectionEntry entry = name2PubSubConnection.remove(new PubSubKey(channelName, e));
+            //已经被别的线程remove了
             if (entry == null) {
                 lock.release();
                 result.complete(null);
                 return;
             }
-
+            // 互斥锁 value为1的信号量
             freePubSubLock.acquire(() -> {
                 PubSubEntry ee = entry2PubSubConnection.getOrDefault(e, new PubSubEntry());
                 Queue<PubSubConnectionEntry> freePubSubConnections = ee.getEntries();

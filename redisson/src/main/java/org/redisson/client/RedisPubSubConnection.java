@@ -128,6 +128,7 @@ public class RedisPubSubConnection extends RedisConnection {
         future.addListener((FutureListener<Void>) f -> {
             if (!f.isSuccess()) {
                 for (ChannelName channel : channels) {
+                    // remove
                     removeDisconnectListener(channel);
                     onMessage(new PubSubStatusMessage(type, channel));
                 }
