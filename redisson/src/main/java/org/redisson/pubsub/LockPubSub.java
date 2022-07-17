@@ -40,14 +40,19 @@ public class LockPubSub extends PublishSubscribe<RedissonLockEntry> {
 
     @Override
     protected void onMessage(RedissonLockEntry value, Long message) {
+        // 如果是解锁(读锁除外)的
         if (message.equals(UNLOCK_MESSAGE)) {
+            // 监听消息的开始执行 比如等锁的人去竞争锁
+            // 这里就体现了非公平锁的问题 高并发下可能会很多个线程一起过去尝试获取锁导致redis压力大
             Runnable runnableToExecute = value.getListeners().poll();
             if (runnableToExecute != null) {
                 runnableToExecute.run();
             }
 
             value.getLatch().release();
-        } else if (message.equals(READ_UNLOCK_MESSAGE)) {
+        }
+        // 读锁解锁的消息处理
+        else if (message.equals(READ_UNLOCK_MESSAGE)) {
             while (true) {
                 Runnable runnableToExecute = value.getListeners().poll();
                 if (runnableToExecute == null) {

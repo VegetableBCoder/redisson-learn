@@ -47,7 +47,7 @@ import java.util.concurrent.locks.Condition;
 public abstract class RedissonBaseLock extends RedissonExpirable implements RLock {
 
     public static class ExpirationEntry {
-
+        //这里只会有一个entry 为什么使用map?
         private final Map<Long, Integer> threadIds = new LinkedHashMap<>();
         private volatile Timeout timeout;
 
@@ -56,6 +56,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         }
 
         public synchronized void addThreadId(long threadId) {
+            // value记录了锁被获取到的次数(重入)
             threadIds.compute(threadId, (t, counter) -> {
                 counter = Optional.ofNullable(counter).orElse(0);
                 counter++;
@@ -72,6 +73,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
             return threadIds.keySet().iterator().next();
         }
         public synchronized void removeThreadId(long threadId) {
+            //移除线程id信息
             threadIds.compute(threadId, (t, counter) -> {
                 if (counter == null) {
                     return null;
@@ -124,10 +126,11 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         if (ee == null) {
             return;
         }
-        
-        Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
+        // 创建任务 这里用的是netty的HashedWheelTimer 关于这个任务可以去了解netty源码
+         Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
             @Override
             public void run(Timeout timeout) throws Exception {
+                //取到锁的信息(过期时间 )
                 ExpirationEntry ent = EXPIRATION_RENEWAL_MAP.get(getEntryName());
                 if (ent == null) {
                     return;
@@ -136,19 +139,21 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                 if (threadId == null) {
                     return;
                 }
-                
+                //在这里去更新锁的过期时间
                 CompletionStage<Boolean> future = renewExpirationAsync(threadId);
                 future.whenComplete((res, e) -> {
                     if (e != null) {
+                        //报错了
                         log.error("Can't update lock " + getRawName() + " expiration", e);
                         EXPIRATION_RENEWAL_MAP.remove(getEntryName());
                         return;
                     }
-                    
+                    //如果锁还存在的话 再创建延迟任务
                     if (res) {
                         // reschedule itself
                         renewExpiration();
                     } else {
+                        //锁被释放了 取消续签任务
                         cancelExpirationRenewal(null);
                     }
                 });
@@ -160,15 +165,20 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
     
     protected void scheduleExpirationRenewal(long threadId) {
         ExpirationEntry entry = new ExpirationEntry();
+        // getEntryName-> 客户端id:锁名称
         ExpirationEntry oldEntry = EXPIRATION_RENEWAL_MAP.putIfAbsent(getEntryName(), entry);
+        //已经有看门狗了(本次是锁的重入)
         if (oldEntry != null) {
             oldEntry.addThreadId(threadId);
         } else {
             entry.addThreadId(threadId);
             try {
+                // 创建续签任务
                 renewExpiration();
             } finally {
+                // 如果发生线程打断
                 if (Thread.currentThread().isInterrupted()) {
+                    // 取消续签
                     cancelExpirationRenewal(threadId);
                 }
             }
@@ -177,6 +187,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
 
     protected CompletionStage<Boolean> renewExpirationAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                //返回锁是否存在 锁存在的话重置过期时间
                 "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
                         "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                         "return 1; " +
@@ -193,9 +204,10 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         }
         
         if (threadId != null) {
+            //这里其实会对value进行--操作
             task.removeThreadId(threadId);
         }
-
+        //没有线程持有锁才会真正移除续签任务
         if (threadId == null || task.hasNoThreads()) {
             Timeout timeout = task.getTimeout();
             if (timeout != null) {
@@ -220,6 +232,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
             if (ex != null) {
                 throw new CompletionException(ex);
             }
+            // 保证同步到slave节点
             if (commandExecutor.getConnectionManager().getCfg().isCheckLockSyncedSlaves()
                     && res.getSyncedSlaves() == 0 && availableSlaves > 0) {
                 throw new CompletionException(
@@ -314,6 +327,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         RFuture<Boolean> future = unlockInnerAsync(threadId);
 
         CompletionStage<Void> f = future.handle((opStatus, e) -> {
+            //取消续签任务 如果没有真正释放锁 里面是不会真正取消任务的
             cancelExpirationRenewal(threadId);
 
             if (e != null) {

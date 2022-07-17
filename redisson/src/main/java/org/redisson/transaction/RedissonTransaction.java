@@ -171,7 +171,7 @@ public class RedissonTransaction implements RTransaction {
         checkState();
         
         checkTimeout();
-        
+
         BatchOptions batchOptions = createOptions();
         
         CommandBatchService transactionExecutor = new CommandBatchService(commandExecutor, batchOptions);
