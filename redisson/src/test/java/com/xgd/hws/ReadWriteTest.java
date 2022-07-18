@@ -23,11 +23,11 @@ class ReadWriteTest {
     @Test
     void readWrite() throws InterruptedException {
         List<CompletableFuture<Void>> list = new ArrayList<>();
+        // for (int i = 0; i < 5; i++) {
+        //     list.add(read());
+        // }
         for (int i = 0; i < 3; i++) {
             list.add(write());
-        }
-        for (int i = 0; i < 5; i++) {
-            list.add(read());
         }
         CompletableFuture.allOf(list.toArray(new CompletableFuture[0]))
             .thenRun(() -> System.out.println("Finished"))
@@ -42,7 +42,7 @@ class ReadWriteTest {
                 boolean b = lock.tryLock(30, -1, TimeUnit.SECONDS);
                 if (b) {
                     System.out.println("Thread " + Thread.currentThread().getId() + " get read lock, time:" + System.currentTimeMillis() / 1000);
-                    Thread.sleep(3000);
+                    Thread.sleep(30000);
                 }
             } catch (InterruptedException e) {
                 System.out.println("Thread" + Thread.currentThread().getId() + " interrupted.");
@@ -60,7 +60,7 @@ class ReadWriteTest {
                 boolean b = lock.tryLock(30, -1, TimeUnit.SECONDS);
                 if (b) {
                     System.out.println("Thread " + Thread.currentThread().getId() + " get write lock, time:" + System.currentTimeMillis() / 1000);
-                    Thread.sleep(2000);
+                    Thread.sleep(20000);
                 }
             } catch (InterruptedException e) {
                 System.out.println("Thread" + Thread.currentThread().getId() + " interrupted.");

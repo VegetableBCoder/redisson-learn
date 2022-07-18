@@ -51,26 +51,38 @@ public class RedissonWriteLock extends RedissonLock implements RLock {
     protected String getLockName(long threadId) {
         return super.getLockName(threadId) + ":write";
     }
-    
+
     @Override
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
+                            //获取mode
                             "local mode = redis.call('hget', KEYS[1], 'mode'); " +
+                            // 无锁
                             "if (mode == false) then " +
+                                    //标记 当前是写锁
                                   "redis.call('hset', KEYS[1], 'mode', 'write'); " +
+                                    //set 重入次数
                                   "redis.call('hset', KEYS[1], ARGV[2], 1); " +
+                                    //设置过期时间
                                   "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                                   "return nil; " +
                               "end; " +
+                            // 如果是写锁
                               "if (mode == 'write') then " +
+                            // 判断自己是不是持有写锁 (排它性)
                                   "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
-                                      "redis.call('hincrby', KEYS[1], ARGV[2], 1); " + 
+                                      // 重入次数
+                                      "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                                      // 过期时间
                                       "local currentExpire = redis.call('pttl', KEYS[1]); " +
+                                      // 续期
                                       "redis.call('pexpire', KEYS[1], currentExpire + ARGV[1]); " +
                                       "return nil; " +
                                   "end; " +
                                 "end;" +
+                                //取锁失败了 返回ttl
                                 "return redis.call('pttl', KEYS[1]);",
+                        //问题 如果仅有自己持有读锁是不是可以加写锁?
                         Arrays.<Object>asList(getRawName()),
                         unit.toMillis(leaseTime), getLockName(threadId));
     }
@@ -96,7 +108,7 @@ public class RedissonWriteLock extends RedissonLock implements RLock {
                             "redis.call('hdel', KEYS[1], ARGV[3]); " +
                             "if (redis.call('hlen', KEYS[1]) == 1) then " +
                                 "redis.call('del', KEYS[1]); " +
-                                "redis.call('publish', KEYS[2], ARGV[1]); " + 
+                                "redis.call('publish', KEYS[2], ARGV[1]); " +
                             "else " +
                                 // has unlocked read-locks
                                 "redis.call('hset', KEYS[1], 'mode', 'read'); " +
@@ -109,7 +121,7 @@ public class RedissonWriteLock extends RedissonLock implements RLock {
         Arrays.<Object>asList(getRawName(), getChannelName()),
         LockPubSub.READ_UNLOCK_MESSAGE, internalLockLeaseTime, getLockName(threadId));
     }
-    
+
     @Override
     public Condition newCondition() {
         throw new UnsupportedOperationException();
