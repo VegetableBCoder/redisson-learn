@@ -90,27 +90,40 @@ public class RedissonWriteLock extends RedissonLock implements RLock {
     @Override
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                // 当前锁的状态
                 "local mode = redis.call('hget', KEYS[1], 'mode'); " +
+                // 无锁 直接publish
                 "if (mode == false) then " +
                     "redis.call('publish', KEYS[2], ARGV[1]); " +
                     "return 1; " +
                 "end;" +
+                // 当前是写锁
                 "if (mode == 'write') then " +
+                    // 判断是不是自己持有的
                     "local lockExists = redis.call('hexists', KEYS[1], ARGV[3]); " +
+                    // 其他线程锁住 自己不能去解锁
                     "if (lockExists == 0) then " +
                         "return nil;" +
                     "else " +
+                        // 重入次数-1
                         "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
+                        //还有重入次数
                         "if (counter > 0) then " +
+                            //更新过期时间
                             "redis.call('pexpire', KEYS[1], ARGV[2]); " +
                             "return 0; " +
+                        //没重入计数了
                         "else " +
+                            // 删掉自己的持有记录
                             "redis.call('hdel', KEYS[1], ARGV[3]); " +
+                            // 如果自己没有持有读锁
                             "if (redis.call('hlen', KEYS[1]) == 1) then " +
+                                //整把锁一起删了
                                 "redis.call('del', KEYS[1]); " +
+                                //发布消息,其他线程来竞争
                                 "redis.call('publish', KEYS[2], ARGV[1]); " +
                             "else " +
-                                // has unlocked read-locks
+                                // 还有读锁没解开 改成读锁模式 其他线程尝试加读锁就能成功了
                                 "redis.call('hset', KEYS[1], 'mode', 'read'); " +
                             "end; " +
                             "return 1; "+
