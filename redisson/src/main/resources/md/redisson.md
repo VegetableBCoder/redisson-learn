@@ -63,3 +63,8 @@ LocalCachedMapOptions options = LocalCachedMapOptions
 ## MapCacheEvictionTask 过期检查实现原理
 
 > 
+
+## 布隆过滤器
+
+> k 为哈希函数个数，m 为布隆过滤器长度，n 为插入的元素个数，p 为误报率
+>
