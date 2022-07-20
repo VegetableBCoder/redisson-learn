@@ -32,7 +32,7 @@ class RBloomFilterTest {
     @Test
     void bloomFilterOperation() {
         //开源版不支持集群布隆过滤器 需要自己去实现
-        //思路1:按照hash函数分到不同节点上去 但是要考虑hash函数个数和节点个数的负载关系
+        //思路1:按照hash函数分到不同节点上去 单个key会比较大但是要考虑hash函数个数和节点个数的负载关系
         //思路2:按照hash分段放到不同节点 这种应该比较适合
         RBloomFilter<String> bloomFilter = redisson.getBloomFilter("test-bloom");
         //设置最大个数和允许的误判率(无法精确判断是否一定存在 但是可以判断一定不存在)

@@ -1,5 +1,6 @@
 package com.xgd.hws;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.redisson.Redisson;
 import org.redisson.RedissonLock;
@@ -18,7 +19,10 @@ public class RedissonLockTest {
      * 默认会连localhost:6379
      */
     private static final Redisson redisson = (Redisson) Redisson.create();
-
+    @AfterAll
+    static void close() {
+        redisson.shutdown();
+    }
     @Test
     void unFairLock() throws InterruptedException {
         // new 一个锁对象

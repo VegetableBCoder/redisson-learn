@@ -1,5 +1,6 @@
 package com.xgd.hws;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.redisson.Redisson;
 import org.redisson.api.RPatternTopic;
@@ -17,7 +18,10 @@ import java.util.concurrent.CountDownLatch;
  */
 class RedissonPubSubTest {
     private static final Redisson redisson = (Redisson) Redisson.create();
-
+    @AfterAll
+    static void close() {
+        redisson.shutdown();
+    }
     @Test
     void testStatusListener() throws InterruptedException {
         RPatternTopic patternTopic = redisson.getPatternTopic("test.topic.*", StringCodec.INSTANCE);

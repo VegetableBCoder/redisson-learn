@@ -126,7 +126,9 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
     }
     
     private CompletableFuture<Boolean> tryAcquireAsync(long permits, long timeoutInMillis) {
+        // 当前时间
         long s = System.currentTimeMillis();
+        //
         RFuture<Long> future = tryAcquireAsync(RedisCommands.EVAL_LONG, permits);
         return future.thenCompose(delay -> {
             if (delay == null) {
@@ -175,26 +177,32 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
         ThreadLocalRandom.current().nextBytes(random);
 
         return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
+                // 限流配置的的阈值
                 "local rate = redis.call('hget', KEYS[1], 'rate');"
+                // 区间的毫秒数
               + "local interval = redis.call('hget', KEYS[1], 'interval');"
+                // 类型 全局还是单机限流
               + "local type = redis.call('hget', KEYS[1], 'type');"
+                // 断言
               + "assert(rate ~= false and interval ~= false and type ~= false, 'RateLimiter is not initialized')"
-              
+                // 不同类型的key不同
               + "local valueName = KEYS[2];"
               + "local permitsName = KEYS[4];"
               + "if type == '1' then "
                   + "valueName = KEYS[3];"
                   + "permitsName = KEYS[5];"
               + "end;"
-
+                // 请求的权重大于了限流的阈值 即这个请求无论如何都不能被允许
               + "assert(tonumber(rate) >= tonumber(ARGV[1]), 'Requested permits amount could not exceed defined rate'); "
-
+                // 当前值
               + "local currentValue = redis.call('get', valueName); "
               + "local res;"
               + "if currentValue ~= false then "
+                    // 已经超过了当前时间的请求记录
                      + "local expiredValues = redis.call('zrangebyscore', permitsName, 0, tonumber(ARGV[2]) - interval); "
                      + "local released = 0; "
                      + "for i, v in ipairs(expiredValues) do "
+                    //B: unsigned char c0: 动态长度的字符序列 字符串的长度
                           + "local random, permits = struct.unpack('Bc0I', v);"
                           + "released = released + permits;"
                      + "end; "

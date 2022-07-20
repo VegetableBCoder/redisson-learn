@@ -1,12 +1,12 @@
 /**
  * Copyright (c) 2013-2021 Nikita Koksharov
- *
+ * <p>
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -60,6 +60,7 @@ public class RedissonSpinLock extends RedissonBaseLock {
     @Override
     public void lock() {
         try {
+            // 1
             lockInterruptibly(-1, null);
         } catch (InterruptedException e) {
             throw new IllegalStateException();
@@ -83,13 +84,17 @@ public class RedissonSpinLock extends RedissonBaseLock {
     @Override
     public void lockInterruptibly(long leaseTime, TimeUnit unit) throws InterruptedException {
         long threadId = Thread.currentThread().getId();
+        // 获取锁 没取到就拿到ttl
         Long ttl = tryAcquire(leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
             return;
         }
+        // LockOptions.defaults() -> ExponentialBackOff
         LockOptions.BackOffPolicy backOffPolicy = backOff.create();
         while (ttl != null) {
+            //等待一段时间 再尝试获取锁 等待的时间会逐渐递增
+            /**  @see LockOptions.ExponentialBackOffPolicy#getNextSleepPeriod() (default)*/
             long nextSleepPeriod = backOffPolicy.getNextSleepPeriod();
             Thread.sleep(nextSleepPeriod);
             ttl = tryAcquire(leaseTime, unit, threadId);
@@ -101,14 +106,16 @@ public class RedissonSpinLock extends RedissonBaseLock {
     }
 
     private <T> RFuture<Long> tryAcquireAsync(long leaseTime, TimeUnit unit, long threadId) {
+        // 这里也是有无watchdog区分
         if (leaseTime > 0) {
             return tryLockInnerAsync(leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
         }
         RFuture<Long> ttlRemainingFuture = tryLockInnerAsync(internalLockLeaseTime,
-                TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
+            TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
         ttlRemainingFuture.thenAccept(ttlRemaining -> {
             // lock acquired
             if (ttlRemaining == null) {
+                // 这里是base类的watchdog
                 scheduleExpirationRenewal(threadId);
             }
         });
@@ -124,18 +131,23 @@ public class RedissonSpinLock extends RedissonBaseLock {
         internalLockLeaseTime = unit.toMillis(leaseTime);
 
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
-                "if (redis.call('exists', KEYS[1]) == 0) then " +
-                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
-                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +
-                        "return nil; " +
-                        "end; " +
-                        "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
-                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
-                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +
-                        "return nil; " +
-                        "end; " +
-                        "return redis.call('pttl', KEYS[1]);",
-                Collections.singletonList(getRawName()), internalLockLeaseTime, getLockName(threadId));
+            // 判断有没有锁
+            "if (redis.call('exists', KEYS[1]) == 0) then " +
+                // 重入计数
+                "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                // 过期时间
+                "redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                "return nil; " +
+                "end; " +
+                // 是自己持有的锁 重入次数++ 更新过期时间
+                "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
+                "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                "redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                "return nil; " +
+                "end; " +
+                // 没拿到锁 返回ttl
+                "return redis.call('pttl', KEYS[1]);",
+            Collections.singletonList(getRawName()), internalLockLeaseTime, getLockName(threadId));
     }
 
     @Override
@@ -179,6 +191,7 @@ public class RedissonSpinLock extends RedissonBaseLock {
     @Override
     public void unlock() {
         try {
+            //unlock 就和普通redisson锁一样
             get(unlockAsync(Thread.currentThread().getId()));
         } catch (RedisException e) {
             if (e.getCause() instanceof IllegalMonitorStateException) {
@@ -198,30 +211,30 @@ public class RedissonSpinLock extends RedissonBaseLock {
     public RFuture<Boolean> forceUnlockAsync() {
         cancelExpirationRenewal(null);
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if (redis.call('del', KEYS[1]) == 1) then "
-                        + "return 1 "
-                        + "else "
-                        + "return 0 "
-                        + "end",
-                Collections.singletonList(getRawName()));
+            "if (redis.call('del', KEYS[1]) == 1) then "
+                + "return 1 "
+                + "else "
+                + "return 0 "
+                + "end",
+            Collections.singletonList(getRawName()));
     }
 
 
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if (redis.call('hexists', KEYS[1], ARGV[2]) == 0) then " +
-                        "return nil;" +
-                        "end; " +
-                        "local counter = redis.call('hincrby', KEYS[1], ARGV[2], -1); " +
-                        "if (counter > 0) then " +
-                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +
-                        "return 0; " +
-                        "else " +
-                        "redis.call('del', KEYS[1]); " +
-                        "return 1; " +
-                        "end; " +
-                        "return nil;",
-                Collections.singletonList(getRawName()), internalLockLeaseTime, getLockName(threadId));
+            "if (redis.call('hexists', KEYS[1], ARGV[2]) == 0) then " +
+                "return nil;" +
+                "end; " +
+                "local counter = redis.call('hincrby', KEYS[1], ARGV[2], -1); " +
+                "if (counter > 0) then " +
+                "redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                "return 0; " +
+                "else " +
+                "redis.call('del', KEYS[1]); " +
+                "return 1; " +
+                "end; " +
+                "return nil;",
+            Collections.singletonList(getRawName()), internalLockLeaseTime, getLockName(threadId));
     }
 
     @Override
@@ -268,8 +281,8 @@ public class RedissonSpinLock extends RedissonBaseLock {
 
             long nextSleepPeriod = backOffPolicy.getNextSleepPeriod();
             commandExecutor.getConnectionManager().newTimeout(
-                    timeout -> lockAsync(leaseTime, unit, currentThreadId, result, backOffPolicy),
-                    nextSleepPeriod, TimeUnit.MILLISECONDS);
+                timeout -> lockAsync(leaseTime, unit, currentThreadId, result, backOffPolicy),
+                nextSleepPeriod, TimeUnit.MILLISECONDS);
         });
     }
 
@@ -336,8 +349,8 @@ public class RedissonSpinLock extends RedissonBaseLock {
 
             long nextSleepPeriod = backOffPolicy.getNextSleepPeriod();
             commandExecutor.getConnectionManager().newTimeout(
-                    timeout -> tryLock(leaseTime, unit, currentThreadId, result, time, backOffPolicy),
-                    nextSleepPeriod, TimeUnit.MILLISECONDS);
+                timeout -> tryLock(leaseTime, unit, currentThreadId, result, time, backOffPolicy),
+                nextSleepPeriod, TimeUnit.MILLISECONDS);
         });
     }
 

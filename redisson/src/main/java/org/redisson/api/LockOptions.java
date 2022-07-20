@@ -129,6 +129,7 @@ public class LockOptions {
         private int fails;
         private long nextSleep;
 
+        // 默认 1 128 2
         private ExponentialBackOffPolicy(long initialDelay, long maxDelay, int multiplier) {
             this.nextSleep = initialDelay;
             this.maxDelay = maxDelay;
@@ -137,10 +138,12 @@ public class LockOptions {
 
         @Override
         public long getNextSleepPeriod() {
+            // 如果是最大的 就不*2了
             if (nextSleep == maxDelay) {
                 return maxDelay;
             }
             long result = nextSleep;
+            //计算等待的时长 原来的*2+失败次数以内的随机值 但是不能超maxDelay
             nextSleep = nextSleep * multiplier + ThreadLocalRandom.current().nextInt(++fails);
             nextSleep = Math.min(maxDelay, nextSleep);
             return result;

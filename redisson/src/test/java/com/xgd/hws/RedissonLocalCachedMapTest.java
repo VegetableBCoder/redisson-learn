@@ -1,5 +1,6 @@
 package com.xgd.hws;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.redisson.Redisson;
@@ -26,7 +27,10 @@ class RedissonLocalCachedMapTest {
     static void createClient() {
         redisson = Redisson.create();
     }
-
+    @AfterAll
+    static void close() {
+        redisson.shutdown();
+    }
     @Test
     void redissonCachedMap() {
         LocalCachedMapOptions options = LocalCachedMapOptions
