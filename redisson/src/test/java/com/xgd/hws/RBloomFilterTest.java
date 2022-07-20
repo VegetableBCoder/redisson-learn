@@ -36,7 +36,7 @@ class RBloomFilterTest {
         //思路2:按照hash分段放到不同节点 这种应该比较适合
         RBloomFilter<String> bloomFilter = redisson.getBloomFilter("test-bloom");
         //设置最大个数和允许的误判率(无法精确判断是否一定存在 但是可以判断一定不存在)
-        bloomFilter.tryInit(1000 * 1000, 0.005f);
+        bloomFilter.tryInit(1000, 0.005f);
         bloomFilter.add("aaa");
         bloomFilter.add("bbb");
 
@@ -44,6 +44,5 @@ class RBloomFilterTest {
         assertFalse(bloomFilter.contains("aa"));
         assertTrue(bloomFilter.contains("aaa"));
 
-        redisson.getDelayedQueue(redisson.getDeque("aaa"));
     }
 }

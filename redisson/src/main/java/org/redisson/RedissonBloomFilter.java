@@ -99,6 +99,7 @@ public class RedissonBloomFilter<T> extends RedissonExpirable implements RBloomF
 
     @Override
     public boolean add(T object) {
+        //hash 128 两个long
         long[] hashes = hash(object);
 
         while (true) {
@@ -108,7 +109,7 @@ public class RedissonBloomFilter<T> extends RedissonExpirable implements RBloomF
 
             int hashIterations = this.hashIterations;
             long size = this.size;
-
+            // 计算放1的位置
             long[] indexes = hash(hashes[0], hashes[1], hashIterations, size);
 
             CommandBatchService executorService = new CommandBatchService(commandExecutor);
@@ -119,12 +120,14 @@ public class RedissonBloomFilter<T> extends RedissonExpirable implements RBloomF
             }
             try {
                 List<Boolean> result = (List<Boolean>) executorService.execute().getResponses();
-
+                // 是否success
                 for (Boolean val : result.subList(1, result.size()-1)) {
+                    //只要有原来的位是0 就是true
                     if (!val) {
                         return true;
                     }
                 }
+                //原来对应的位全是1
                 return false;
             } catch (RedisException e) {
                 if (e.getMessage() == null || !e.getMessage().contains("Bloom filter config has been changed")) {
@@ -138,13 +141,17 @@ public class RedissonBloomFilter<T> extends RedissonExpirable implements RBloomF
         long[] indexes = new long[iterations];
         long hash = hash1;
         for (int i = 0; i < iterations; i++) {
+            //去除符号位
             indexes[i] = (hash & Long.MAX_VALUE) % size;
             if (i % 2 == 0) {
+                // hash 高低位相加
                 hash += hash2;
             } else {
+                //循环+
                 hash += hash1;
             }
         }
+        //得到的位置信息
         return indexes;
     }
 

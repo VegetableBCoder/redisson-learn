@@ -33,7 +33,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 
+ *
  * @author Nikita Koksharov
  *
  */
@@ -54,26 +54,26 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
     String getValueName() {
         return suffixName(getRawName(), "value");
     }
-    
+
     String getClientValueName() {
         return suffixName(getValueName(), commandExecutor.getConnectionManager().getId());
     }
-    
+
     @Override
     public boolean tryAcquire() {
         return tryAcquire(1);
     }
-    
+
     @Override
     public RFuture<Boolean> tryAcquireAsync() {
         return tryAcquireAsync(1L);
     }
-    
+
     @Override
     public boolean tryAcquire(long permits) {
         return get(tryAcquireAsync(RedisCommands.EVAL_NULL_BOOLEAN, permits));
     }
-    
+
     @Override
     public RFuture<Boolean> tryAcquireAsync(long permits) {
         return tryAcquireAsync(RedisCommands.EVAL_NULL_BOOLEAN, permits);
@@ -83,7 +83,7 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
     public void acquire() {
         get(acquireAsync());
     }
-    
+
     @Override
     public RFuture<Void> acquireAsync() {
         return acquireAsync(1);
@@ -109,12 +109,12 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
     public RFuture<Boolean> tryAcquireAsync(long timeout, TimeUnit unit) {
         return tryAcquireAsync(1, timeout, unit);
     }
-    
+
     @Override
     public boolean tryAcquire(long permits, long timeout, TimeUnit unit) {
         return get(tryAcquireAsync(permits, timeout, unit));
     }
-    
+
     @Override
     public RFuture<Boolean> tryAcquireAsync(long permits, long timeout, TimeUnit unit) {
         long timeoutInMillis = -1;
@@ -124,7 +124,7 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
         CompletableFuture<Boolean> f = tryAcquireAsync(permits, timeoutInMillis);
         return new CompletableFutureWrapper<>(f);
     }
-    
+
     private CompletableFuture<Boolean> tryAcquireAsync(long permits, long timeoutInMillis) {
         // 当前时间
         long s = System.currentTimeMillis();
@@ -134,7 +134,7 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
             if (delay == null) {
                 return CompletableFuture.completedFuture(true);
             }
-            
+
             if (timeoutInMillis == -1) {
                 CompletableFuture<Boolean> f = new CompletableFuture<>();
                 commandExecutor.getConnectionManager().getGroup().schedule(() -> {
@@ -143,7 +143,7 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
                 }, delay, TimeUnit.MILLISECONDS);
                 return f;
             }
-            
+
             long el = System.currentTimeMillis() - s;
             long remains = timeoutInMillis - el;
             if (remains <= 0) {
@@ -171,7 +171,7 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
             return f;
         }).toCompletableFuture();
     }
-    
+
     private <T> RFuture<T> tryAcquireAsync(RedisCommand<T> command, Long value) {
         byte[] random = new byte[8];
         ThreadLocalRandom.current().nextBytes(random);
@@ -194,7 +194,7 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
               + "end;"
                 // 请求的权重大于了限流的阈值 即这个请求无论如何都不能被允许
               + "assert(tonumber(rate) >= tonumber(ARGV[1]), 'Requested permits amount could not exceed defined rate'); "
-                // 当前值
+                // 当前占用的权重值
               + "local currentValue = redis.call('get', valueName); "
               + "local res;"
               + "if currentValue ~= false then "
@@ -202,23 +202,29 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
                      + "local expiredValues = redis.call('zrangebyscore', permitsName, 0, tonumber(ARGV[2]) - interval); "
                      + "local released = 0; "
                      + "for i, v in ipairs(expiredValues) do "
-                    //B: unsigned char c0: 动态长度的字符序列 字符串的长度
+                    //B: unsigned char c0: 动态长度的字符序列 I:整数(permits)
                           + "local random, permits = struct.unpack('Bc0I', v);"
+                    // 计算过期了的权重?
                           + "released = released + permits;"
                      + "end; "
 
                      + "if released > 0 then "
+                    // 把过期的删了
                           + "redis.call('zremrangebyscore', permitsName, 0, tonumber(ARGV[2]) - interval); "
+                    // 当前的+过期的 > rate
                           + "if tonumber(currentValue) + released > tonumber(rate) then "
+                    // 当前值 = 最大值 - 元素个数?
                                + "currentValue = tonumber(rate) - redis.call('zcard', permitsName); "
                           + "else "
                                + "currentValue = tonumber(currentValue) + released; "
                           + "end; "
                           + "redis.call('set', valueName, currentValue);"
+
                      + "end;"
 
                      + "if tonumber(currentValue) < tonumber(ARGV[1]) then "
                          + "local firstValue = redis.call('zrange', permitsName, 0, 0, 'withscores'); "
+                    // 加了3ms
                          + "res = 3 + interval - (tonumber(ARGV[2]) - tonumber(firstValue[2]));"
                      + "else "
                          + "redis.call('zadd', permitsName, ARGV[2], struct.pack('Bc0I', string.len(ARGV[3]), ARGV[3], ARGV[1])); "
@@ -270,7 +276,7 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
                         + "redis.call('del', KEYS[2], KEYS[3]);",
                 Arrays.asList(getRawName(), getValueName(), getPermitsName()), rate, unit.toMillis(rateInterval), type.ordinal());
     }
-    
+
     private static final RedisCommand HGETALL = new RedisCommand("HGETALL", new MapEntriesDecoder(new MultiDecoder<RateLimiterConfig>() {
 
         @Override
@@ -287,14 +293,14 @@ public class RedissonRateLimiter extends RedissonExpirable implements RRateLimit
             Long rate = Long.valueOf(map.get("rate"));
             return new RateLimiterConfig(type, rateInterval, rate);
         }
-        
+
     }));
-    
+
     @Override
     public RateLimiterConfig getConfig() {
         return get(getConfigAsync());
     }
-    
+
     @Override
     public RFuture<RateLimiterConfig> getConfigAsync() {
         return commandExecutor.readAsync(getRawName(), StringCodec.INSTANCE, HGETALL, getRawName());
