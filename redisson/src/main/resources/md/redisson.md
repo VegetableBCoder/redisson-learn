@@ -2,8 +2,6 @@
 
 ## Local Cache 本地缓存功能
 
-> 直接对应redis hash
-
 ```
 LocalCachedMapOptions options = LocalCachedMapOptions
     .defaults()
@@ -66,5 +64,12 @@ LocalCachedMapOptions options = LocalCachedMapOptions
 
 ## 布隆过滤器
 
-> k 为哈希函数个数，m 为布隆过滤器长度，n 为插入的元素个数，p 为误报率
->
+* 布隆过滤器将输入数据进行多次hash后存储到
+* 
+* 布隆过滤器牺牲了一定的精确性换取空间占用率的下降
+
+### 误报概率公式 k 为哈希函数个数，m 为布隆过滤器长度，n 为插入的元素个数，p 为误报率 可以看到hash函数的个数对误报率的
+
+![bloom/rate-p.jpg](./bloom/rate-p.png)
+
+

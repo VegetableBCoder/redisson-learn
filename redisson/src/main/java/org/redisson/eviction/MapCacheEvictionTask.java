@@ -59,38 +59,37 @@ public class MapCacheEvictionTask extends EvictionTask {
     RFuture<Integer> execute() {
         int latchExpireTime = Math.min(delay, 30);
         // 参数1 当前时间戳
-        // 参数2 最多对多少个key进行过期删除(默认100个) 有点像G1垃圾回收器 尽量减少单词GC性能损耗
-        //
+        // 参数2 最多对多少个key进行过期删除(默认100个) 有点像G1垃圾回收器 尽量减少单次GC性能损耗
+        // lua的for 初始值 max,每次的增量
         return
             //keys[6]=redisson__execute_task_once_latch:{key}  redisson_map_cache_expired:{key}
-            //使用setnx 是为了防止多个线程同时去对一个map进行过期回收
+            // 使用setnx 是为了防止多个线程同时去对一个map进行过期回收
             executor.evalWriteNoRetryAsync(name, LongCodec.INSTANCE, RedisCommands.EVAL_INTEGER,
                 "if redis.call('setnx', KEYS[6], ARGV[4]) == 0 then "
                  + "return -1;"
               + "end;"
-            // 如果成功了就为这个清理的任务设置一个过期时间 latchExpireTime(这个跟最近清理的结果有关)
+            // 为这个清理的任务设置一个过期时间 latchExpireTime (这个跟最近清理的结果有关)
               + "redis.call('expire', KEYS[6], ARGV[3]); "
             // 从超时的 timeout set 按时间戳(score) 查询过期keys(对多keysLimit个) 并为它声明一个局部变量 expiredKeys1
-            // zrangebyscore redisson__idle__set:{test-cache} 0 当前时间戳 limit 0 keysLimit
+            // zrangebyscore redisson__timeout__set:{key-name} 0 当前时间戳 limit 0 keysLimit
                +"local expiredKeys1 = redis.call('zrangebyscore', KEYS[2], 0, ARGV[1], 'limit', 0, ARGV[2]); "
-            // 查询每个已过期的 判断他们是不是
+            // 查询每个已过期的 判断他们是不是再hash中还存在
                 + "for i, key in ipairs(expiredKeys1) do "
                     + "local v = redis.call('hget', KEYS[1], key); "
                     + "if v ~= false then "
-                    // 这里这个struct.unpack是lua的解包方法 dLc0 d表示 double L表示unsigned  Long , c0:动态长度的字符序列
-                    // 整体的用途是 将结果拆分为 前面的数字序号1,2,3 和后面的key字符串
+                    // 这里这个struct.unpack是lua的解包方法 dLc0 d表示 double L表示unsigned  Long(这里是说明后面动态字符串的长度) , c0:动态长度的字符序列
+                    // 整体的用途是 将结果拆分为 前面的数字序号 和后面的key字符串
                         + "local t, val = struct.unpack('dLc0', v); "
                     // 打包结果是将key和val拼接起来 通过publish发送给其他subscriber
                         + "local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(val), val); "
                         + "local listeners = redis.call('publish', KEYS[4], msg); "
-                    // 这里没有else的逻辑
+                    // 这里感觉写的有点潦草.. 为什么在这里再break 不先判断再进来
                         + "if (listeners == 0) then "
                             + "break;"
                         + "end; "
                     + "end;"
                 + "end;"
-                // 初始值 max,每次的增量
-                // #数组 ,getn返回的都是最大下标 且遇到NIL就不统计了
+                // #数组 ,getn返回的都是最大下标 且遇到NIL就不统计了 getn({1,2,nil,3})=2
                 + "for i=1, #expiredKeys1, 5000 do "
                     //unpack把数组拆出来 一批最多删5000条
                     + "redis.call('zrem', KEYS[5], unpack(expiredKeys1, i, math.min(i+4999, table.getn(expiredKeys1)))); "
@@ -98,7 +97,7 @@ public class MapCacheEvictionTask extends EvictionTask {
                     + "redis.call('zrem', KEYS[2], unpack(expiredKeys1, i, math.min(i+4999, table.getn(expiredKeys1)))); "
                     + "redis.call('hdel', KEYS[1], unpack(expiredKeys1, i, math.min(i+4999, table.getn(expiredKeys1)))); "
                 + "end; "
-                // 从没有使用到的取前 100条
+                // 从没有使用到的idle set 取前 100条(默认100) (按照上次访问时间排序的)
               + "local expiredKeys2 = redis.call('zrangebyscore', KEYS[3], 0, ARGV[1], 'limit', 0, ARGV[2]); "
               + "for i, key in ipairs(expiredKeys2) do "
                     //消息发布
@@ -119,6 +118,7 @@ public class MapCacheEvictionTask extends EvictionTask {
                   + "redis.call('zrem', KEYS[2], unpack(expiredKeys2, i, math.min(i+4999, table.getn(expiredKeys2)))); "
                   + "redis.call('hdel', KEYS[1], unpack(expiredKeys2, i, math.min(i+4999, table.getn(expiredKeys2)))); "
               + "end; "
+            // 返回的 timeout_set清理的数量和
               + "return #expiredKeys1 + #expiredKeys2;",
               Arrays.<Object>asList(name, timeoutSetName, maxIdleSetName, expiredChannelName, lastAccessTimeSetName, executeTaskOnceLatchName),
               System.currentTimeMillis(), keysLimit, latchExpireTime, 1);
