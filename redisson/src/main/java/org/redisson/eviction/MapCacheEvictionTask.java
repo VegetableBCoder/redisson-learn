@@ -80,7 +80,7 @@ public class MapCacheEvictionTask extends EvictionTask {
                     // 这里这个struct.unpack是lua的解包方法 dLc0 d表示 double L表示unsigned  Long(这里是说明后面动态字符串的长度) , c0:动态长度的字符序列
                     // 整体的用途是 将结果拆分为 前面的数字序号 和后面的key字符串
                         + "local t, val = struct.unpack('dLc0', v); "
-                    // 打包结果是将key和val拼接起来 通过publish发送给其他subscriber
+                    // 打包结果是将key和val拼接起来 通过publish发送给其他subscriber(主要是给本地缓存清理) 但是开源版并不同时支持本地缓存和hash key淘汰机制
                         + "local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(val), val); "
                         + "local listeners = redis.call('publish', KEYS[4], msg); "
                     // 这里感觉写的有点潦草.. 为什么在这里再break 不先判断再进来

@@ -1,12 +1,12 @@
 /**
  * Copyright (c) 2013-2021 Nikita Koksharov
- *
+ * <p>
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,9 +16,19 @@
 package org.redisson;
 
 import io.netty.buffer.ByteBuf;
-import org.redisson.api.*;
+import org.redisson.api.EvictionMode;
+import org.redisson.api.MapOptions;
+import org.redisson.api.RFuture;
+import org.redisson.api.RMapCache;
+import org.redisson.api.RTopic;
+import org.redisson.api.RedissonClient;
 import org.redisson.api.listener.MessageListener;
-import org.redisson.api.map.event.*;
+import org.redisson.api.map.event.EntryCreatedListener;
+import org.redisson.api.map.event.EntryEvent;
+import org.redisson.api.map.event.EntryExpiredListener;
+import org.redisson.api.map.event.EntryRemovedListener;
+import org.redisson.api.map.event.EntryUpdatedListener;
+import org.redisson.api.map.event.MapEntryListener;
 import org.redisson.client.RedisClient;
 import org.redisson.client.codec.Codec;
 import org.redisson.client.codec.LongCodec;
@@ -26,7 +36,11 @@ import org.redisson.client.codec.StringCodec;
 import org.redisson.client.protocol.RedisCommand;
 import org.redisson.client.protocol.RedisCommands;
 import org.redisson.client.protocol.convertor.NumberConvertor;
-import org.redisson.client.protocol.decoder.*;
+import org.redisson.client.protocol.decoder.ListMultiDecoder2;
+import org.redisson.client.protocol.decoder.MapCacheScanResult;
+import org.redisson.client.protocol.decoder.MapCacheScanResultReplayDecoder;
+import org.redisson.client.protocol.decoder.MapValueDecoder;
+import org.redisson.client.protocol.decoder.ObjectMapDecoder;
 import org.redisson.codec.BaseEventCodec;
 import org.redisson.codec.MapCacheEventCodec;
 import org.redisson.command.CommandAsyncExecutor;
@@ -35,7 +49,13 @@ import org.redisson.eviction.EvictionScheduler;
 import org.redisson.misc.CompletableFutureWrapper;
 
 import java.math.BigDecimal;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
@@ -63,7 +83,7 @@ import java.util.function.Function;
 public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCache<K, V> {
 
     private EvictionScheduler evictionScheduler;
-    
+
     public RedissonMapCache(EvictionScheduler evictionScheduler, CommandAsyncExecutor commandExecutor,
                             String name, RedissonClient redisson, MapOptions<K, V> options, WriteBehindService writeBehindService) {
         super(commandExecutor, name, redisson, options, writeBehindService);
@@ -95,16 +115,16 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     public RFuture<Boolean> trySetMaxSizeAsync(int maxSize) {
         return trySetMaxSizeAsync(maxSize, EvictionMode.LRU);
     }
-    
+
     public RFuture<Boolean> trySetMaxSizeAsync(int maxSize, EvictionMode mode) {
         if (maxSize < 0) {
             throw new IllegalArgumentException("maxSize should be greater than zero");
         }
 
         return commandExecutor.evalWriteNoRetryAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "redis.call('hsetnx', KEYS[1], 'max-size', ARGV[1]);"
-              + "return redis.call('hsetnx', KEYS[1], 'mode', ARGV[2]);",
-                Collections.singletonList(getOptionsName()), maxSize, mode);
+            "redis.call('hsetnx', KEYS[1], 'max-size', ARGV[1]);"
+                + "return redis.call('hsetnx', KEYS[1], 'mode', ARGV[2]);",
+            Collections.singletonList(getOptionsName()), maxSize, mode);
     }
 
     @Override
@@ -139,42 +159,55 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     @Override
     protected RFuture<Boolean> containsKeyOperationAsync(String name, Object key) {
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-        "local value = redis.call('hget', KEYS[1], ARGV[2]); " +
+            // key1: map的key key2: timeoutset key3:idleset key4:lastAccess key5:配置信息 {name}:redisson_options
+            //arg1: 当前时间 arg2: encode之后的hash key
+
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); " +
                 "local expireDate = 92233720368547758; " +
                 "if value ~= false then " +
-
+                // 有没有最大size检查 并且是LRU (其实这里只有LRU,LFU)
                 "    local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
                 "    if maxSize ~= nil and maxSize ~= 0 then " +
+                         // 淘汰算法
                 "        local mode = redis.call('hget', KEYS[5], 'mode'); " +
                 "        if mode == false or mode == 'LRU' then " +
+                                // 记录自己的最后一次访问时间 后续会根据这个进行淘汰
                 "               redis.call('zadd', KEYS[4], tonumber(ARGV[1]), ARGV[2]); " +
                 "        else " +
+                                // 使用次数+1
                 "               redis.call('zincrby', KEYS[4], 1, ARGV[2]); " +
                 "        end; " +
                 "    end;" +
-
+                    // 超时的时间
                 "    local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); " +
+                    // 过期时间戳
                 "    if expireDateScore ~= false then " +
                 "        expireDate = tonumber(expireDateScore) " +
                 "    end; " +
+                    // 解包
                 "    local t, val = struct.unpack('dLc0', value); " +
                 "    if t ~= 0 then " +
+                         // 未被访问的set取时间戳
                 "        local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); " +
                 "        if expireIdle ~= false then " +
+                             // idle的时间戳>当前时间
                 "            if tonumber(expireIdle) > tonumber(ARGV[1]) then " +
+                                // zadd idle-set-key timestamp hash-key
                 "                redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); " +
                 "            end ;" +
+                             // 过期时间 = 取到的过期时间和idle的时间
                 "            expireDate = math.min(expireDate, tonumber(expireIdle)) " +
                 "        end; " +
                 "    end; " +
+                // 已经过期 返回0
                 "    if expireDate <= tonumber(ARGV[1]) then " +
                 "        return 0; " +
                 "    end; " +
                 "    return 1;" +
                 "end;" +
                 "return 0; ",
-                Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getLastAccessTimeSetName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key));
+            Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getLastAccessTimeSetName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key));
     }
 
     @Override
@@ -182,7 +215,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         checkValue(value);
 
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
-        "local s = redis.call('hgetall', KEYS[1]); " +
+            "local s = redis.call('hgetall', KEYS[1]); " +
                 "for i, v in ipairs(s) do " +
                 "    if i % 2 == 0 then " +
                 "        local t, val = struct.unpack('dLc0', v); " +
@@ -221,15 +254,15 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "    end;" +
                 "end;" +
                 "return 0;",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                System.currentTimeMillis(), encodeMapValue(value));
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            System.currentTimeMillis(), encodeMapValue(value));
     }
 
     @Override
     public RFuture<Map<K, V>> getAllOperationAsync(Set<K> keys) {
         List<Object> args = new ArrayList<Object>(keys.size() + 1);
         List<Object> plainKeys = new ArrayList<Object>(keys.size());
-        
+
         args.add(System.currentTimeMillis());
         for (K key : keys) {
             plainKeys.add(key);
@@ -237,46 +270,46 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         }
 
         return commandExecutor.evalWriteAsync(getRawName(), codec, new RedisCommand<Map<Object, Object>>("EVAL",
-                        new MapValueDecoder(new MapGetAllDecoder(plainKeys, 0))),
+                new MapValueDecoder(new MapGetAllDecoder(plainKeys, 0))),
             "local expireHead = redis.call('zrange', KEYS[2], 0, 0, 'withscores'); " +
-            "local currentTime = tonumber(table.remove(ARGV, 1)); " + // index is the first parameter
-            "local hasExpire = #expireHead == 2 and tonumber(expireHead[2]) <= currentTime; " +
-            "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));" +
-            "local map = {}; " +
-            "for i = 1, #ARGV, 1 do " +
-            "    local value = redis.call('hget', KEYS[1], ARGV[i]); " + 
-            "    map[i] = false;" +
-            "    if value ~= false then " +
-            "        local key = ARGV[i]; " +
-            "        local t, val = struct.unpack('dLc0', value); " +
-            "        map[i] = val; " +
-            "        if maxSize ~= nil and maxSize ~= 0 then " +
-            "                local mode = redis.call('hget', KEYS[5], 'mode'); " +
-            "                if mode == false or mode == 'LRU' then " +
-            "                    redis.call('zadd', KEYS[4], currentTime, key); " +
-            "                else " +
-            "                    redis.call('zincrby', KEYS[4], 1, key); " +
-            "                end; " +
-            "        end; " +
-            "        if hasExpire then " +
-            "            local expireDate = redis.call('zscore', KEYS[2], key); " +
-            "            if expireDate ~= false and tonumber(expireDate) <= currentTime then " +
-            "                map[i] = false; " +
-            "            end; " +
-            "        end; " +
-            "        if t ~= 0 then " +
-            "            local expireIdle = redis.call('zscore', KEYS[3], key); " +
-            "            if expireIdle ~= false then " +
-            "                if tonumber(expireIdle) > currentTime then " +
-            "                    redis.call('zadd', KEYS[3], t + currentTime, key); " +
-            "                else " +
-            "                    map[i] = false; " +
-            "                end; " +
-            "            end; " +
-            "        end; " +
-            "    end; " +
-            "end; " +
-            "return map;",
+                "local currentTime = tonumber(table.remove(ARGV, 1)); " + // index is the first parameter
+                "local hasExpire = #expireHead == 2 and tonumber(expireHead[2]) <= currentTime; " +
+                "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));" +
+                "local map = {}; " +
+                "for i = 1, #ARGV, 1 do " +
+                "    local value = redis.call('hget', KEYS[1], ARGV[i]); " +
+                "    map[i] = false;" +
+                "    if value ~= false then " +
+                "        local key = ARGV[i]; " +
+                "        local t, val = struct.unpack('dLc0', value); " +
+                "        map[i] = val; " +
+                "        if maxSize ~= nil and maxSize ~= 0 then " +
+                "                local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "                if mode == false or mode == 'LRU' then " +
+                "                    redis.call('zadd', KEYS[4], currentTime, key); " +
+                "                else " +
+                "                    redis.call('zincrby', KEYS[4], 1, key); " +
+                "                end; " +
+                "        end; " +
+                "        if hasExpire then " +
+                "            local expireDate = redis.call('zscore', KEYS[2], key); " +
+                "            if expireDate ~= false and tonumber(expireDate) <= currentTime then " +
+                "                map[i] = false; " +
+                "            end; " +
+                "        end; " +
+                "        if t ~= 0 then " +
+                "            local expireIdle = redis.call('zscore', KEYS[3], key); " +
+                "            if expireIdle ~= false then " +
+                "                if tonumber(expireIdle) > currentTime then " +
+                "                    redis.call('zadd', KEYS[3], t + currentTime, key); " +
+                "                else " +
+                "                    map[i] = false; " +
+                "                end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
+                "end; " +
+                "return map;",
             Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
             args.toArray());
     }
@@ -300,7 +333,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     public RFuture<V> putIfAbsentAsync(K key, V value, long ttl, TimeUnit ttlUnit, long maxIdleTime, TimeUnit maxIdleUnit) {
         checkKey(key);
         checkValue(value);
-        
+
         if (ttl < 0) {
             throw new IllegalArgumentException("ttl can't be negative");
         }
@@ -333,96 +366,96 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
 
         String name = getRawName(key);
         RFuture<V> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local insertable = false; "
-                        + "local value = redis.call('hget', KEYS[1], ARGV[5]); "
-                            + "if value == false then "
-                            + "insertable = true; "
-                        + "else "
-                            + "local t, val = struct.unpack('dLc0', value); "
-                            + "local expireDate = 92233720368547758; "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
-                                + "if expireIdle ~= false then "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                            + "if expireDate <= tonumber(ARGV[1]) then "
-                                + "insertable = true; "
-                            + "end; "
-                        + "end; "
+            "local insertable = false; "
+                + "local value = redis.call('hget', KEYS[1], ARGV[5]); "
+                + "if value == false then "
+                + "insertable = true; "
+                + "else "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "insertable = true; "
+                + "end; "
+                + "end; "
 
-                        + "if insertable == true then "
-                            // ttl
-                            + "if tonumber(ARGV[2]) > 0 then "
-                                + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
-                            + "else "
-                                + "redis.call('zrem', KEYS[2], ARGV[5]); "
-                            + "end; "
+                + "if insertable == true then "
+                // ttl
+                + "if tonumber(ARGV[2]) > 0 then "
+                + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
+                + "else "
+                + "redis.call('zrem', KEYS[2], ARGV[5]); "
+                + "end; "
 
-                            // idle
-                            + "if tonumber(ARGV[3]) > 0 then "
-                                + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
-                            + "else "
-                                + "redis.call('zrem', KEYS[3], ARGV[5]); "
-                            + "end; "
+                // idle
+                + "if tonumber(ARGV[3]) > 0 then "
+                + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
+                + "else "
+                + "redis.call('zrem', KEYS[3], ARGV[5]); "
+                + "end; "
 
-                            // last access time
-                            + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); " +
-                            "if maxSize ~= nil and maxSize ~= 0 then " +
-                            "    local currentTime = tonumber(ARGV[1]); " +
-                            "    local lastAccessTimeSetName = KEYS[5]; " +
+                // last access time
+                + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "    local currentTime = tonumber(ARGV[1]); " +
+                "    local lastAccessTimeSetName = KEYS[5]; " +
 
-                                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
-                                "end; " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
+                "end; " +
 
-                            "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                            "    if cacheSize >= maxSize then " +
-                            "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
-                            "        for index, lruItem in ipairs(lruItems) do " +
-                            "            if lruItem and lruItem ~= ARGV[5] then " +
-                            "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                            "                redis.call('hdel', KEYS[1], lruItem); " +
-                            "                redis.call('zrem', KEYS[2], lruItem); " +
-                            "                redis.call('zrem', KEYS[3], lruItem); " +
-                            "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                            "                if lruItemValue ~= false then " +
-                                "                local removedChannelName = KEYS[6]; " +
-                                                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                                "                redis.call('publish', removedChannelName, msg); " +
-                                             "end; " +
-                            "            end; " +
-                            "        end; " +
-                            "    end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize >= maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[5] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                "                if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[6]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                                "if mode == 'LFU' then " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
-                                "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
+                "end; " +
 
-                            "end; "
+                "end; "
 
-                            // value
-                            + "local val = struct.pack('dLc0', tonumber(ARGV[4]), string.len(ARGV[6]), ARGV[6]); "
-                            + "redis.call('hset', KEYS[1], ARGV[5], val); "
+                // value
+                + "local val = struct.pack('dLc0', tonumber(ARGV[4]), string.len(ARGV[6]), ARGV[6]); "
+                + "redis.call('hset', KEYS[1], ARGV[5], val); "
 
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
-                            + "redis.call('publish', KEYS[4], msg); "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
+                + "redis.call('publish', KEYS[4], msg); "
 
-                            + "return nil; "
-                        + "else "
-                            + "local t, val = struct.unpack('dLc0', value); "
-                            + "redis.call('zadd', KEYS[3], t + ARGV[1], ARGV[5]); "
-                            + "return val; "
-                        + "end; ",
-                Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
+                + "return nil; "
+                + "else "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "redis.call('zadd', KEYS[3], t + ARGV[1], ARGV[5]); "
+                + "return val; "
+                + "end; ",
+            Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
         if (hasNoWriter()) {
             return future;
         }
@@ -434,83 +467,83 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<Boolean> removeOperationAsync(Object key, Object value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "if value == false then "
-                            + "return 0; "
-                        + "end; "
-                        + "local t, val = struct.unpack('dLc0', value); "
-                        + "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                            + "if expireIdle ~= false then "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                            + "end; "
-                        + "end; "
-                        + "if expireDate <= tonumber(ARGV[1]) then "
-                            + "return 0; "
-                        + "end; "
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "if value == false then "
+                + "return 0; "
+                + "end; "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "return 0; "
+                + "end; "
 
-                        + "if val == ARGV[3] then "
-                            + "redis.call('zrem', KEYS[2], ARGV[2]); "
-                            + "redis.call('zrem', KEYS[3], ARGV[2]); "
-                            + "local maxSize = tonumber(redis.call('hget', KEYS[6], 'max-size')); " +
-                                "if maxSize ~= nil and maxSize ~= 0 then " +
-                                "   redis.call('zrem', KEYS[5], ARGV[2]); " +
-                                "end; "
-                            + "redis.call('hdel', KEYS[1], ARGV[2]); "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(val), val); "
-                            + "redis.call('publish', KEYS[4], msg); "
-                            + "return 1; "
-                        + "else "
-                            + "return 0; "
-                        + "end",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getRemovedChannelName(name),
-                        getLastAccessTimeSetName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+                + "if val == ARGV[3] then "
+                + "redis.call('zrem', KEYS[2], ARGV[2]); "
+                + "redis.call('zrem', KEYS[3], ARGV[2]); "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[6], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "   redis.call('zrem', KEYS[5], ARGV[2]); " +
+                "end; "
+                + "redis.call('hdel', KEYS[1], ARGV[2]); "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(val), val); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return 1; "
+                + "else "
+                + "return 0; "
+                + "end",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getRemovedChannelName(name),
+                getLastAccessTimeSetName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
     @Override
     public RFuture<V> getOperationAsync(K key) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "if value == false then "
-                            + "return nil; "
-                        + "end; "
-                        + "local t, val = struct.unpack('dLc0', value); "
-                        + "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                            + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                    + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
-                                + "end; "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                            + "end; "
-                        + "end; "
-                        + "if expireDate <= tonumber(ARGV[1]) then "
-                            + "return nil; "
-                        + "end; "
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then " +
-                            "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                            "if mode == false or mode == 'LRU' then " +
-                                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), ARGV[2]); " +
-                            "else " +
-                                "redis.call('zincrby', KEYS[4], 1, ARGV[2]); " +
-                            "end; " +
-                        "end; "
-                        + "return val; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getLastAccessTimeSetName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key));
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "if value == false then "
+                + "return nil; "
+                + "end; "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "return nil; "
+                + "end; "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), ARGV[2]); " +
+                "else " +
+                "redis.call('zincrby', KEYS[4], 1, ARGV[2]); " +
+                "end; " +
+                "end; "
+                + "return val; ",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getLastAccessTimeSetName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key));
     }
 
     @Override
@@ -522,7 +555,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<V> putOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local v = redis.call('hget', KEYS[1], ARGV[2]);" +
+            "local v = redis.call('hget', KEYS[1], ARGV[2]);" +
                 "local exists = false;" +
                 "if v ~= false then" +
                 "    local t, val = struct.unpack('dLc0', v);" +
@@ -553,9 +586,9 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "local mode = redis.call('hget', KEYS[8], 'mode'); " +
                 "if exists == false then" +
                 "    if maxSize ~= nil and maxSize ~= 0 then " +
-                        "if mode == false or mode == 'LRU' then " +
-                            "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                        "end; " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "end; " +
                 "        local cacheSize = tonumber(redis.call('hlen', KEYS[1]));" +
                 "        if cacheSize > maxSize then" +
                 "            local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1);" +
@@ -567,28 +600,28 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "                    redis.call('zrem', KEYS[3], lruItem);" +
                 "                    redis.call('zrem', lastAccessTimeSetName, lruItem);" +
                 "                    if lruItemValue ~= false then " +
-                    "                    local removedChannelName = KEYS[7];" +
-                                        "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                    "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                    "                    redis.call('publish', removedChannelName, msg);" +
-                                    "end; " +
+                "                    local removedChannelName = KEYS[7];" +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                    redis.call('publish', removedChannelName, msg);" +
+                "end; " +
                 "                end;" +
                 "            end" +
                 "        end;" +
-                        "if mode == 'LFU' then " +
-                            "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                        "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
                 "    end;" +
                 "    local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]);" +
                 "    redis.call('publish', KEYS[4], msg);" +
                 "    return nil;" +
                 "else" +
                 "    if maxSize ~= nil and maxSize ~= 0 then " +
-                        "if mode == false or mode == 'LRU' then " +
-                            "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                        "else " +
-                            "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                        "end; " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "else " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
                 "    end;" +
                 "end;" +
                 "" +
@@ -596,179 +629,179 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3], string.len(val), val);" +
                 "redis.call('publish', KEYS[5], msg);" +
                 "return val;",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
     @Override
     protected RFuture<V> putIfExistsOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                    "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "if value == false then "
-                            + "return nil;"
-                        + "end; "
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size'));"
-                        + "local lastAccessTimeSetName = KEYS[5]; "
-                        + "local currentTime = tonumber(ARGV[1]); "
-                        + "local t, val;"
-                        + "if value ~= false then "
-                            + "t, val = struct.unpack('dLc0', value); "
-                            + "local expireDate = 92233720368547758; "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                                + "if expireIdle ~= false then "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                            + "if expireDate > tonumber(ARGV[1]) then "
-                                + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                    "local mode = redis.call('hget', KEYS[7], 'mode'); " +
-                                    "if mode == false or mode == 'LRU' then " +
-                                        "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                                    "else " +
-                                        "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                                    "end; "
-                                + "end; "
-                            + "else "
-                                + "return nil; "
-                            + "end; "
-                        + "end; "
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "if value == false then "
+                + "return nil;"
+                + "end; "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size'));"
+                + "local lastAccessTimeSetName = KEYS[5]; "
+                + "local currentTime = tonumber(ARGV[1]); "
+                + "local t, val;"
+                + "if value ~= false then "
+                + "t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "else " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; "
+                + "end; "
+                + "else "
+                + "return nil; "
+                + "end; "
+                + "end; "
 
-                        + "local newValue = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
-                        + "redis.call('hset', KEYS[1], ARGV[2], newValue); "
+                + "local newValue = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('hset', KEYS[1], ARGV[2], newValue); "
 
-                        // last access time
-                        + "if maxSize ~= nil and maxSize ~= 0 then " +
-                            "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                // last access time
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
 
-                            "if mode == false or mode == 'LRU' then " +
-                                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                            "end; " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "end; " +
 
-                        "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                        "    if cacheSize > maxSize then " +
-                        "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
-                        "        for index, lruItem in ipairs(lruItems) do " +
-                        "            if lruItem and lruItem ~= ARGV[2] then " +
-                        "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                        "                redis.call('hdel', KEYS[1], lruItem); " +
-                        "                redis.call('zrem', KEYS[2], lruItem); " +
-                        "                redis.call('zrem', KEYS[3], lruItem); " +
-                        "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                        "                if lruItemValue ~= false then " +
-                            "                local removedChannelName = KEYS[6]; " +
-                                            "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                redis.call('publish', removedChannelName, msg); " +
-                                        "end; " +
-                        "            end; " +
-                        "        end; " +
-                        "    end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize > maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[2] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                "                if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[6]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                            "if mode == 'LFU' then " +
-                                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                            "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
 
-                        "end; "
+                "end; "
 
-                        + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3], string.len(val), val); "
-                        + "redis.call('publish', KEYS[4], msg); "
-                        + "return val;",
-                Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getUpdatedChannelName(name),
-                        getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+                + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3], string.len(val), val); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return val;",
+            Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getUpdatedChannelName(name),
+                getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
     @Override
     protected RFuture<V> putIfAbsentOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size'));"
-                        + "local lastAccessTimeSetName = KEYS[5]; "
-                        + "local currentTime = tonumber(ARGV[1]); "
-                        + "if value ~= false then "
-                            + "local t, val = struct.unpack('dLc0', value); "
-                            + "local expireDate = 92233720368547758; "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                                + "if expireIdle ~= false then "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                            + "if expireDate > tonumber(ARGV[1]) then "
-                                + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                    "local mode = redis.call('hget', KEYS[7], 'mode'); " +
-                                    "if mode == false or mode == 'LRU' then " +
-                                        "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                                    "else " +
-                                        "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                                    "end; "
-                                + "end; "
-                                + "return val; "
-                            + "end; "
-                        + "end; "
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size'));"
+                + "local lastAccessTimeSetName = KEYS[5]; "
+                + "local currentTime = tonumber(ARGV[1]); "
+                + "if value ~= false then "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "else " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; "
+                + "end; "
+                + "return val; "
+                + "end; "
+                + "end; "
 
-                        + "local value = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
-                        + "redis.call('hset', KEYS[1], ARGV[2], value); "
+                + "local value = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('hset', KEYS[1], ARGV[2], value); "
 
-                        // last access time
-                        + "if maxSize ~= nil and maxSize ~= 0 then " +
-                            "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                // last access time
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
 
-                            "if mode == false or mode == 'LRU' then " +
-                                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                            "end; " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "end; " +
 
-                        "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                        "    if cacheSize > maxSize then " +
-                        "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
-                        "        for index, lruItem in ipairs(lruItems) do " +
-                        "            if lruItem and lruItem ~= ARGV[2] then " +
-                        "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                        "                redis.call('hdel', KEYS[1], lruItem); " +
-                        "                redis.call('zrem', KEYS[2], lruItem); " +
-                        "                redis.call('zrem', KEYS[3], lruItem); " +
-                        "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                        "                if lruItemValue ~= false then " +
-                            "                local removedChannelName = KEYS[6]; " +
-                                            "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                redis.call('publish', removedChannelName, msg); " + 
-                                        "end; " +
-                        "            end; " +
-                        "        end; " +
-                        "    end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize > maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[2] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                "                if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[6]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                            "if mode == 'LFU' then " +
-                                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                            "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
 
-                        "end; "
+                "end; "
 
-                        + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                        + "redis.call('publish', KEYS[4], msg); "
-                        + "return nil;",
-                Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return nil;",
+            Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
-    
+
     @Override
     public void putAll(Map<? extends K, ? extends V> map, long ttl, TimeUnit ttlUnit) {
         get(putAllAsync(map, ttl, ttlUnit));
     }
-    
+
     @Override
     public RFuture<Void> putAllAsync(Map<? extends K, ? extends V> map, long ttl, TimeUnit ttlUnit) {
         if (map.isEmpty()) {
@@ -794,83 +827,83 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         ByteBuf keyState = encodeMapKey(key);
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, StringCodec.INSTANCE,
-                new RedisCommand<Object>("EVAL", new NumberConvertor(value.getClass())),
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "local expireDate = 92233720368547758; "
-                        + "local t = 0; "
-                        + "local val = 0; "
-                        + "if value ~= false then "
-                            + "t, val = struct.unpack('dLc0', value); "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                                + "if expireIdle ~= false then "
-                                    + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                        + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
-                                    + "end; "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                        + "end; "
+            new RedisCommand<Object>("EVAL", new NumberConvertor(value.getClass())),
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "local expireDate = 92233720368547758; "
+                + "local t = 0; "
+                + "local val = 0; "
+                + "if value ~= false then "
+                + "t, val = struct.unpack('dLc0', value); "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "end; "
 
-                        + "local newValue = tonumber(ARGV[3]); "
-                        + "if value ~= false and expireDate > tonumber(ARGV[1]) then "
-                            + "newValue = tonumber(val) + newValue; "
+                + "local newValue = tonumber(ARGV[3]); "
+                + "if value ~= false and expireDate > tonumber(ARGV[1]) then "
+                + "newValue = tonumber(val) + newValue; "
 
-                            + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(newValue), newValue, string.len(val), val); "
-                            + "redis.call('publish', KEYS[5], msg); "
-                        + "else "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                            + "redis.call('publish', KEYS[4], msg); "
-                        + "end; "
-                        + "local newValuePack = struct.pack('dLc0', t, string.len(newValue), newValue); "
-                        + "redis.call('hset', KEYS[1], ARGV[2], newValuePack); "
+                + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(newValue), newValue, string.len(val), val); "
+                + "redis.call('publish', KEYS[5], msg); "
+                + "else "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "end; "
+                + "local newValuePack = struct.pack('dLc0', t, string.len(newValue), newValue); "
+                + "redis.call('hset', KEYS[1], ARGV[2], newValuePack); "
 
-                        // last access time
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then " +
-                        "    local currentTime = tonumber(ARGV[1]); " +
-                        "    local lastAccessTimeSetName = KEYS[6]; " +
+                // last access time
+                + "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "    local currentTime = tonumber(ARGV[1]); " +
+                "    local lastAccessTimeSetName = KEYS[6]; " +
 
-                            "local mode = redis.call('hget', KEYS[8], 'mode'); " +
+                "local mode = redis.call('hget', KEYS[8], 'mode'); " +
 
-                            "if mode == false or mode == 'LRU' then " +
-                                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                            "end; " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "end; " +
 
-                        "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                        "    if cacheSize > maxSize then " +
-                        "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
-                        "        for index, lruItem in ipairs(lruItems) do " +
-                        "            if lruItem and lruItem ~= ARGV[2] then " +
-                        "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                        "                redis.call('hdel', KEYS[1], lruItem); " +
-                        "                redis.call('zrem', KEYS[2], lruItem); " +
-                        "                redis.call('zrem', KEYS[3], lruItem); " +
-                        "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                        "                if lruItemValue ~= false then " +                        
-                            "                local removedChannelName = KEYS[7]; " +
-                                            "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                redis.call('publish', removedChannelName, msg); " +
-                                        "end; " +
-                        "            end; " +
-                        "        end; " +
-                        "    end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize > maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[2] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                "                if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[7]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                            "if mode == 'LFU' then " +
-                                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                            "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
 
-                        "end; "
+                "end; "
 
-                        + "return tostring(newValue); ",
-                Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), keyState, new BigDecimal(value.toString()).toPlainString());
+                + "return tostring(newValue); ",
+            Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), keyState, new BigDecimal(value.toString()).toPlainString());
     }
 
     @Override
@@ -936,90 +969,90 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
 
         String name = getRawName(key);
         RFuture<Boolean> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "local insertable = false; "
-                        + "local value = redis.call('hget', KEYS[1], ARGV[5]); "
-                        + "local t, val;"
-                        + "if value == false then "
-                            + "insertable = true; "
-                        + "else "
-                            + "t, val = struct.unpack('dLc0', value); "
-                            + "local expireDate = 92233720368547758; "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
-                                + "if expireIdle ~= false then "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                            + "if expireDate <= tonumber(ARGV[1]) then "
-                                + "insertable = true; "
-                            + "end; "
-                        + "end; " +
+            "local insertable = false; "
+                + "local value = redis.call('hget', KEYS[1], ARGV[5]); "
+                + "local t, val;"
+                + "if value == false then "
+                + "insertable = true; "
+                + "else "
+                + "t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "insertable = true; "
+                + "end; "
+                + "end; " +
 
-                        "if tonumber(ARGV[2]) > 0 then "
-                            + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
-                        + "else "
-                            + "redis.call('zrem', KEYS[2], ARGV[5]); "
-                        + "end; "
-                        + "if tonumber(ARGV[3]) > 0 then "
-                            + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
-                        + "else "
-                            + "redis.call('zrem', KEYS[3], ARGV[5]); "
-                        + "end; " +
+                "if tonumber(ARGV[2]) > 0 then "
+                + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
+                + "else "
+                + "redis.call('zrem', KEYS[2], ARGV[5]); "
+                + "end; "
+                + "if tonumber(ARGV[3]) > 0 then "
+                + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
+                + "else "
+                + "redis.call('zrem', KEYS[3], ARGV[5]); "
+                + "end; " +
 
-                        // last access time
-                        "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
-                        "local mode = redis.call('hget', KEYS[8], 'mode'); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then " +
-                        "    local currentTime = tonumber(ARGV[1]); " +
-                        "    local lastAccessTimeSetName = KEYS[6]; " +
+                // last access time
+                "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
+                "local mode = redis.call('hget', KEYS[8], 'mode'); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "    local currentTime = tonumber(ARGV[1]); " +
+                "    local lastAccessTimeSetName = KEYS[6]; " +
 
-                           "if mode == false or mode == 'LRU' then " +
-                               "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
-                           "end; " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
+                "end; " +
 
-                        "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                        "    if cacheSize >= maxSize then " +
-                        "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
-                        "        for index, lruItem in ipairs(lruItems) do " +
-                        "            if lruItem and lruItem ~= ARGV[5] then " +
-                        "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                        "                redis.call('hdel', KEYS[1], lruItem); " +
-                        "                redis.call('zrem', KEYS[2], lruItem); " +
-                        "                redis.call('zrem', KEYS[3], lruItem); " +
-                        "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                        "                if lruItemValue ~= false then " +
-                            "                local removedChannelName = KEYS[7]; " +
-                                            "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                redis.call('publish', removedChannelName, msg); " +
-                                        "end; " +
-                        "            end; " +
-                        "        end; " +
-                        "    end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize >= maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[5] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                "                if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[7]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                            "if mode == 'LFU' then " +
-                                 "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
-                            "end; " +
-                        "end; "
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
+                "end; " +
+                "end; "
 
-                        + "local value = struct.pack('dLc0', ARGV[4], string.len(ARGV[6]), ARGV[6]); "
-                        + "redis.call('hset', KEYS[1], ARGV[5], value); "
-                        + "if insertable == true then "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
-                            + "redis.call('publish', KEYS[4], msg); "
-                            + "return 1;"
-                        + "else "
-                            + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6], string.len(val), val); "
-                            + "redis.call('publish', KEYS[5], msg); "
-                            + "return 0;"
-                        + "end;",
-                Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
+                + "local value = struct.pack('dLc0', ARGV[4], string.len(ARGV[6]), ARGV[6]); "
+                + "redis.call('hset', KEYS[1], ARGV[5], value); "
+                + "if insertable == true then "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return 1;"
+                + "else "
+                + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6], string.len(val), val); "
+                + "redis.call('publish', KEYS[5], msg); "
+                + "return 0;"
+                + "end;",
+            Arrays.<Object>asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
         return future;
     }
 
@@ -1046,56 +1079,56 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
 
         String name = getRawName(key);
         RFuture<Boolean> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                        "local value = redis.call('hget', KEYS[1], ARGV[4]); "
-                        + "local t, val;"
-                        + "if value == false then "
-                            + "return 0; "
-                        + "else "
-                            + "t, val = struct.unpack('dLc0', value); "
-                            + "local expireDate = 92233720368547758; "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[4]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[4]); "
-                                + "if expireIdle ~= false then "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                            + "if expireDate <= tonumber(ARGV[1]) then "
-                                + "return 0; "
-                            + "end; "
-                        + "end; " +
+            "local value = redis.call('hget', KEYS[1], ARGV[4]); "
+                + "local t, val;"
+                + "if value == false then "
+                + "return 0; "
+                + "else "
+                + "t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[4]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[4]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "return 0; "
+                + "end; "
+                + "end; " +
 
-                        "if tonumber(ARGV[2]) > 0 then "
-                            + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[4]); "
-                        + "else "
-                            + "redis.call('zrem', KEYS[2], ARGV[4]); "
-                        + "end; "
-                        + "if tonumber(ARGV[3]) > 0 then "
-                            + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[4]); "
-                        + "else "
-                            + "redis.call('zrem', KEYS[3], ARGV[4]); "
-                        + "end; " +
+                "if tonumber(ARGV[2]) > 0 then "
+                + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[4]); "
+                + "else "
+                + "redis.call('zrem', KEYS[2], ARGV[4]); "
+                + "end; "
+                + "if tonumber(ARGV[3]) > 0 then "
+                + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[4]); "
+                + "else "
+                + "redis.call('zrem', KEYS[3], ARGV[4]); "
+                + "end; " +
 
-                        // last access time
-                        "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
-                        "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then " +
-                           "local currentTime = tonumber(ARGV[1]); " +
+                // last access time
+                "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
+                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local currentTime = tonumber(ARGV[1]); " +
 
-                           "if mode == false or mode == 'LRU' then " +
-                               "redis.call('zadd', KEYS[4], currentTime, ARGV[4]); " +
-                           "end; " +
-                           "if mode == 'LFU' then " +
-                                "redis.call('zincrby', KEYS[4], 1, ARGV[4]); " +
-                           "end; " +
-                        "end; " +
-                        "return 1;",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name),
-                              getLastAccessTimeSetName(name), getOptionsName(name)),
-                System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, encodeMapKey(key));
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', KEYS[4], currentTime, ARGV[4]); " +
+                "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', KEYS[4], 1, ARGV[4]); " +
+                "end; " +
+                "end; " +
+                "return 1;",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name),
+                getLastAccessTimeSetName(name), getOptionsName(name)),
+            System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, encodeMapKey(key));
         return future;
     }
 
@@ -1156,97 +1189,97 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     }
 
     protected RFuture<V> putOperationAsync(K key, V value, long ttlTimeout, long maxIdleTimeout,
-            long maxIdleDelta, long ttlTimeoutDelta) {
+                                           long maxIdleDelta, long ttlTimeoutDelta) {
         String name = getRawName(key);
         RFuture<V> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local insertable = false; "
-                        + "local v = redis.call('hget', KEYS[1], ARGV[5]); "
-                        + "if v == false then "
-                            + "insertable = true; "
-                        + "else "
-                            + "local t, val = struct.unpack('dLc0', v); "
-                            + "local expireDate = 92233720368547758; "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
-                                + "if expireIdle ~= false then "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                            + "if expireDate <= tonumber(ARGV[1]) then "
-                                + "insertable = true; "
-                            + "end; "
-                        + "end; "
+            "local insertable = false; "
+                + "local v = redis.call('hget', KEYS[1], ARGV[5]); "
+                + "if v == false then "
+                + "insertable = true; "
+                + "else "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "insertable = true; "
+                + "end; "
+                + "end; "
 
-                        + "if tonumber(ARGV[2]) > 0 then "
-                            + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
-                        + "else "
-                            + "redis.call('zrem', KEYS[2], ARGV[5]); "
-                        + "end; "
-                        + "if tonumber(ARGV[3]) > 0 then "
-                            + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
-                        + "else "
-                            + "redis.call('zrem', KEYS[3], ARGV[5]); "
-                        + "end; "
+                + "if tonumber(ARGV[2]) > 0 then "
+                + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
+                + "else "
+                + "redis.call('zrem', KEYS[2], ARGV[5]); "
+                + "end; "
+                + "if tonumber(ARGV[3]) > 0 then "
+                + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
+                + "else "
+                + "redis.call('zrem', KEYS[3], ARGV[5]); "
+                + "end; "
 
-                        // last access time
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then " +
-                        "    local currentTime = tonumber(ARGV[1]); " +
-                        "    local lastAccessTimeSetName = KEYS[6]; " +
+                // last access time
+                + "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "    local currentTime = tonumber(ARGV[1]); " +
+                "    local lastAccessTimeSetName = KEYS[6]; " +
 
-                    "        local mode = redis.call('hget', KEYS[8], 'mode'); " +
-                    "        if mode == false or mode == 'LRU' then " +
-                    "            redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
-                    "        end; " +
+                "        local mode = redis.call('hget', KEYS[8], 'mode'); " +
+                "        if mode == false or mode == 'LRU' then " +
+                "            redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
+                "        end; " +
 
-                        "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                        "    if cacheSize >= maxSize then " +
-                        "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
-                        "        for index, lruItem in ipairs(lruItems) do " +
-                        "            if lruItem and lruItem ~= ARGV[5] then " +
-                        "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                        "                redis.call('hdel', KEYS[1], lruItem); " +
-                        "                redis.call('zrem', KEYS[2], lruItem); " +
-                        "                redis.call('zrem', KEYS[3], lruItem); " +
-                        "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                                       " if lruItemValue ~= false then " +
-                            "                local removedChannelName = KEYS[7]; " +
-                                            "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                redis.call('publish', removedChannelName, msg); " + 
-                                        "end; " +
-                        "            end; " +
-                        "        end; " +
-                        "    end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize >= maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[5] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                " if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[7]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                            "if mode == 'LFU' then " +
-                                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
-                            "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
+                "end; " +
 
-                        "end; "
+                "end; "
 
-                        + "local value = struct.pack('dLc0', ARGV[4], string.len(ARGV[6]), ARGV[6]); "
-                        + "redis.call('hset', KEYS[1], ARGV[5], value); "
+                + "local value = struct.pack('dLc0', ARGV[4], string.len(ARGV[6]), ARGV[6]); "
+                + "redis.call('hset', KEYS[1], ARGV[5], value); "
 
-                        + "if insertable == true then "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
-                            + "redis.call('publish', KEYS[4], msg); "
-                            + "return nil;"
-                        + "end; "
+                + "if insertable == true then "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return nil;"
+                + "end; "
 
-                        + "local t, val = struct.unpack('dLc0', v); "
+                + "local t, val = struct.unpack('dLc0', v); "
 
-                        + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6], string.len(val), val); "
-                        + "redis.call('publish', KEYS[5], msg); "
+                + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6], string.len(val), val); "
+                + "redis.call('publish', KEYS[5], msg); "
 
-                        + "return val",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
+                + "return val",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
         return future;
     }
 
@@ -1258,22 +1291,22 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     private RFuture<V> getWithTTLOnlyOperationAsync(K key) {
         String name = getRawName(key);
         return commandExecutor.evalReadAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "if value == false then "
-                            + "return nil; "
-                        + "end; "
-                        + "local t, val = struct.unpack('dLc0', value); "
-                        + "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if expireDate <= tonumber(ARGV[1]) then "
-                            + "return nil; "
-                        + "end; "
-                        + "return val; ",
-                Arrays.asList(name, getTimeoutSetName(name)),
-                System.currentTimeMillis(), encodeMapKey(key));
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "if value == false then "
+                + "return nil; "
+                + "end; "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "return nil; "
+                + "end; "
+                + "return val; ",
+            Arrays.asList(name, getTimeoutSetName(name)),
+            System.currentTimeMillis(), encodeMapKey(key));
     }
 
     @Override
@@ -1298,41 +1331,41 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     public long remainTimeToLive(K key) {
         return get(remainTimeToLiveAsync(key));
     }
-    
+
     @Override
     public RFuture<Long> remainTimeToLiveAsync(K key) {
         checkKey(key);
 
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_LONG,
-                        "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "if value == false then "
-                            + "return -2; "
-                        + "end; "
-                        + "local t, val = struct.unpack('dLc0', value); "
-                        + "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                            + "if expireIdle ~= false then "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                            + "end; "
-                        + "end; "
-                            
-                        + "if expireDate == 92233720368547758 then "
-                            + "return -1; "
-                        + "end;"
-                        + "if expireDate > tonumber(ARGV[1]) then "
-                            + "return expireDate - ARGV[1]; "
-                        + "else "
-                            + "return -2; "
-                        + "end; "
-                        + "return val; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name)),
-                System.currentTimeMillis(), encodeMapKey(key));
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "if value == false then "
+                + "return -2; "
+                + "end; "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+
+                + "if expireDate == 92233720368547758 then "
+                + "return -1; "
+                + "end;"
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "return expireDate - ARGV[1]; "
+                + "else "
+                + "return -2; "
+                + "end; "
+                + "return val; ",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name)),
+            System.currentTimeMillis(), encodeMapKey(key));
 
     }
 
@@ -1343,7 +1376,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     String getTimeoutSetName() {
         return prefixName("redisson__timeout__set", getRawName());
     }
-    
+
     String getLastAccessTimeSetName(String name) {
         return prefixName("redisson__map_cache__last_access__set", name);
     }
@@ -1367,7 +1400,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     String getOptionsName(String name) {
         return suffixName(name, "redisson_options");
     }
-    
+
     String getCreatedChannelName(String name) {
         return prefixName("redisson_map_cache_created", name);
     }
@@ -1379,7 +1412,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     String getUpdatedChannelName() {
         return prefixName("redisson_map_cache_updated", getRawName());
     }
-    
+
     String getUpdatedChannelName(String name) {
         return prefixName("redisson_map_cache_updated", name);
     }
@@ -1387,7 +1420,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     String getExpiredChannelName(String name) {
         return prefixName("redisson_map_cache_expired", name);
     }
-    
+
     String getExpiredChannelName() {
         return prefixName("redisson_map_cache_expired", getRawName());
     }
@@ -1395,7 +1428,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     String getRemovedChannelName() {
         return prefixName("redisson_map_cache_removed", getRawName());
     }
-    
+
     String getRemovedChannelName(String name) {
         return prefixName("redisson_map_cache_removed", name);
     }
@@ -1405,38 +1438,38 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<V> removeOperationAsync(K key) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "if value == false then "
-                            + "return nil; "
-                        + "end; "
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "if value == false then "
+                + "return nil; "
+                + "end; "
 
-                        + "local t, val = struct.unpack('dLc0', value); "
-                        + "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                            + "if expireIdle ~= false then "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                            + "end; "
-                        + "end; "
-                        + "if expireDate <= tonumber(ARGV[1]) then "
-                            + "return nil; "
-                        + "end; "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "return nil; "
+                + "end; "
 
-                        + "redis.call('zrem', KEYS[2], ARGV[2]); "
-                        + "redis.call('zrem', KEYS[3], ARGV[2]); "
-                        + "redis.call('zrem', KEYS[5], ARGV[2]); "
-                        + "redis.call('hdel', KEYS[1], ARGV[2]); "
+                + "redis.call('zrem', KEYS[2], ARGV[2]); "
+                + "redis.call('zrem', KEYS[3], ARGV[2]); "
+                + "redis.call('zrem', KEYS[5], ARGV[2]); "
+                + "redis.call('hdel', KEYS[1], ARGV[2]); "
 
-                        + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(val), val); "
-                        + "redis.call('publish', KEYS[4], msg); "
-                        + "return val; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getRemovedChannelName(name),
-                        getLastAccessTimeSetName(name)),
-                System.currentTimeMillis(), encodeMapKey(key));
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(val), val); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return val; ",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getRemovedChannelName(name),
+                getLastAccessTimeSetName(name)),
+            System.currentTimeMillis(), encodeMapKey(key));
     }
 
     @Override
@@ -1447,29 +1480,29 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         }
 
         RFuture<List<Long>> future = commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_LIST,
-                "local maxSize = tonumber(redis.call('hget', KEYS[6], 'max-size')); "
-                        + "if maxSize ~= nil and maxSize ~= 0 then "
-                        + "    redis.call('zrem', KEYS[5], unpack(ARGV)); "
-                        + "end; " +
-                        "redis.call('zrem', KEYS[3], unpack(ARGV)); " +
-                        "redis.call('zrem', KEYS[2], unpack(ARGV)); " +
-                        "for i, key in ipairs(ARGV) do "
-                        + "local v = redis.call('hget', KEYS[1], key); "
-                        + "if v ~= false then "
-                            + "local t, val = struct.unpack('dLc0', v); "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(val), val); "
-                            + "redis.call('publish', KEYS[4], msg); "
-                        + "end; " +
-                        "end; " +
+            "local maxSize = tonumber(redis.call('hget', KEYS[6], 'max-size')); "
+                + "if maxSize ~= nil and maxSize ~= 0 then "
+                + "    redis.call('zrem', KEYS[5], unpack(ARGV)); "
+                + "end; " +
+                "redis.call('zrem', KEYS[3], unpack(ARGV)); " +
+                "redis.call('zrem', KEYS[2], unpack(ARGV)); " +
+                "for i, key in ipairs(ARGV) do "
+                + "local v = redis.call('hget', KEYS[1], key); "
+                + "if v ~= false then "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(val), val); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "end; " +
+                "end; " +
 
-                        "local result = {}; " +
-                        "for i = 1, #ARGV, 1 do "
-                            + "local val = redis.call('hdel', KEYS[1], ARGV[i]); "
-                            + "table.insert(result, val); "
-                        + "end;"
-                        + "return result;",
-                Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getRemovedChannelName(), getLastAccessTimeSetName(), getOptionsName()),
-                args.toArray());
+                "local result = {}; " +
+                "for i = 1, #ARGV, 1 do "
+                + "local val = redis.call('hdel', KEYS[1], ARGV[i]); "
+                + "table.insert(result, val); "
+                + "end;"
+                + "return result;",
+            Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getRemovedChannelName(), getLastAccessTimeSetName(), getOptionsName()),
+            args.toArray());
         return future;
     }
 
@@ -1481,34 +1514,34 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         }
 
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LONG,
-                "local maxSize = tonumber(redis.call('hget', KEYS[6], 'max-size')); "
+            "local maxSize = tonumber(redis.call('hget', KEYS[6], 'max-size')); "
 
-                        + "for i=1, #ARGV, 5000 do "
-                            + "if maxSize ~= nil and maxSize ~= 0 then "
-                                + "redis.call('zrem', KEYS[5], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
-                            + "end; "
+                + "for i=1, #ARGV, 5000 do "
+                + "if maxSize ~= nil and maxSize ~= 0 then "
+                + "redis.call('zrem', KEYS[5], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
+                + "end; "
 
-                            + "redis.call('zrem', KEYS[3], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
-                            + "redis.call('zrem', KEYS[2], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
-                        + "end; "
+                + "redis.call('zrem', KEYS[3], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
+                + "redis.call('zrem', KEYS[2], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
+                + "end; "
 
-                      + "for i, key in ipairs(ARGV) do "
-                        + "local v = redis.call('hget', KEYS[1], key); "
-                        + "if v ~= false then "
-                            + "local t, val = struct.unpack('dLc0', v); "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(val), val); "
-                            + "redis.call('publish', KEYS[4], msg); "
-                        + "end; " +
-                        "end; " +
+                + "for i, key in ipairs(ARGV) do "
+                + "local v = redis.call('hget', KEYS[1], key); "
+                + "if v ~= false then "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(val), val); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "end; " +
+                "end; " +
 
-                        "local n = 0;" +
-                        "for i=1, #ARGV, 5000 do "
-                          + "n = n + redis.call('hdel', KEYS[1], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
-                      + "end; "
+                "local n = 0;" +
+                "for i=1, #ARGV, 5000 do "
+                + "n = n + redis.call('hdel', KEYS[1], unpack(ARGV, i, math.min(i+4999, table.getn(ARGV)))) "
+                + "end; "
 
-                      + "return n; ",
-                Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getRemovedChannelName(), getLastAccessTimeSetName(), getOptionsName()),
-                params.toArray());
+                + "return n; ",
+            Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getRemovedChannelName(), getLastAccessTimeSetName(), getOptionsName()),
+            params.toArray());
     }
 
     @Override
@@ -1517,9 +1550,9 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     }
 
     private static final RedisCommand<MapCacheScanResult<Object, Object>> SCAN = new RedisCommand<MapCacheScanResult<Object, Object>>("EVAL",
-                new ListMultiDecoder2(
-                        new MapCacheScanResultReplayDecoder(),
-                        new ObjectMapDecoder(true)));
+        new ListMultiDecoder2(
+            new MapCacheScanResultReplayDecoder(),
+            new ObjectMapDecoder(true)));
 
     @Override
     public RFuture<ScanResult<Map.Entry<Object, Object>>> scanIteratorAsync(String name, RedisClient client, long startPos, String pattern, int count) {
@@ -1532,44 +1565,44 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         params.add(count);
 
         RFuture<MapCacheScanResult<Object, Object>> future = commandExecutor.evalReadAsync(client, name, codec, SCAN,
-                "local result = {}; "
+            "local result = {}; "
                 + "local idleKeys = {}; "
                 + "local res; "
                 + "if (#ARGV == 4) then "
-                    + " res = redis.call('hscan', KEYS[1], ARGV[2], 'match', ARGV[3], 'count', ARGV[4]); "
+                + " res = redis.call('hscan', KEYS[1], ARGV[2], 'match', ARGV[3], 'count', ARGV[4]); "
                 + "else "
-                    + " res = redis.call('hscan', KEYS[1], ARGV[2], 'count', ARGV[3]); "
+                + " res = redis.call('hscan', KEYS[1], ARGV[2], 'count', ARGV[3]); "
                 + "end;"
                 + "local currentTime = tonumber(ARGV[1]); "
                 + "for i, value in ipairs(res[2]) do "
-                    + "if i % 2 == 0 then "
-                      + "local key = res[2][i-1]; " +
-                        "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], key); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
+                + "if i % 2 == 0 then "
+                + "local key = res[2][i-1]; " +
+                "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
 
-                        + "local t, val = struct.unpack('dLc0', value); "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], key); "
-                            + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > currentTime and expireDate > currentTime then "
-                                    + "table.insert(idleKeys, key); "
-                                + "end; "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                            + "end; "
-                        + "end; "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > currentTime and expireDate > currentTime then "
+                + "table.insert(idleKeys, key); "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
 
-                        + "if expireDate > currentTime then "
-                            + "table.insert(result, key); "
-                            + "table.insert(result, val); "
-                        + "end; "
-                    + "end; "
+                + "if expireDate > currentTime then "
+                + "table.insert(result, key); "
+                + "table.insert(result, val); "
+                + "end; "
+                + "end; "
                 + "end;"
                 + "return {res[1], result, idleKeys};",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name)),
-                params.toArray());
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name)),
+            params.toArray());
 
         CompletionStage<MapCacheScanResult<Object, Object>> f = future.thenApply(res -> {
             if (res.getIdleKeys().isEmpty()) {
@@ -1581,26 +1614,26 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
             encodeMapKeys(args, res.getIdleKeys());
 
             commandExecutor.evalWriteAsync(name, codec, new RedisCommand<Map<Object, Object>>("EVAL",
-                            new MapValueDecoder(new MapGetAllDecoder(args, 1))),
-                    "local currentTime = tonumber(table.remove(ARGV, 1)); " // index is the first parameter
-                            + "local map = redis.call('hmget', KEYS[1], unpack(ARGV)); "
-                            + "for i = #map, 1, -1 do "
-                            + "local value = map[i]; "
-                            + "if value ~= false then "
-                            + "local key = ARGV[i]; "
-                            + "local t, val = struct.unpack('dLc0', value); "
+                    new MapValueDecoder(new MapGetAllDecoder(args, 1))),
+                "local currentTime = tonumber(table.remove(ARGV, 1)); " // index is the first parameter
+                    + "local map = redis.call('hmget', KEYS[1], unpack(ARGV)); "
+                    + "for i = #map, 1, -1 do "
+                    + "local value = map[i]; "
+                    + "if value ~= false then "
+                    + "local key = ARGV[i]; "
+                    + "local t, val = struct.unpack('dLc0', value); "
 
-                            + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[2], key); "
-                            + "if expireIdle ~= false then "
-                            + "if tonumber(expireIdle) > currentTime then "
-                            + "redis.call('zadd', KEYS[2], t + currentTime, key); "
-                            + "end; "
-                            + "end; "
-                            + "end; "
-                            + "end; "
-                            + "end; ",
-                    Arrays.asList(name, getIdleSetName(name)), args.toArray());
+                    + "if t ~= 0 then "
+                    + "local expireIdle = redis.call('zscore', KEYS[2], key); "
+                    + "if expireIdle ~= false then "
+                    + "if tonumber(expireIdle) > currentTime then "
+                    + "redis.call('zadd', KEYS[2], t + currentTime, key); "
+                    + "end; "
+                    + "end; "
+                    + "end; "
+                    + "end; "
+                    + "end; ",
+                Arrays.asList(name, getIdleSetName(name)), args.toArray());
             return res;
         });
 
@@ -1611,225 +1644,225 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<Boolean> fastPutOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "local insertable = false; "
-                        + "local v = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "if v == false then "
-                                + "insertable = true; "
-                        + "else "
-                            + "local t, val = struct.unpack('dLc0', v); "
-                            + "local expireDate = 92233720368547758; "
-                            + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                                + "if expireIdle ~= false then "
-                                    + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                            + "end; "
-                            + "if expireDate <= tonumber(ARGV[1]) then "
-                                + "insertable = true; "
-                            + "end; "
-                        + "end; " +
+            "local insertable = false; "
+                + "local v = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "if v == false then "
+                + "insertable = true; "
+                + "else "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate <= tonumber(ARGV[1]) then "
+                + "insertable = true; "
+                + "end; "
+                + "end; " +
 
-                        "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
-                        + "redis.call('hset', KEYS[1], ARGV[2], val); " +
+                "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('hset', KEYS[1], ARGV[2], val); " +
 
-                        // last access time
-                        "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size'));" +
-                        "if maxSize ~= nil and maxSize ~= 0 then " +
-                        "    local currentTime = tonumber(ARGV[1]); " +
-                        "    local lastAccessTimeSetName = KEYS[6]; " +
-                            "local mode = redis.call('hget', KEYS[8], 'mode'); " +
-                            "if mode == false or mode == 'LRU' then " +
-                                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                            "end; " +
-                        "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                        "    if cacheSize > maxSize then " +
-                        "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
-                        "        for index, lruItem in ipairs(lruItems) do " +
-                        "            if lruItem and lruItem ~= ARGV[2] then " +
-                        "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                        "                redis.call('hdel', KEYS[1], lruItem); " +
-                        "                redis.call('zrem', KEYS[2], lruItem); " +
-                        "                redis.call('zrem', KEYS[3], lruItem); " +
-                        "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                                       " if lruItemValue ~= false then " +
-                            "                local removedChannelName = KEYS[7]; " +
-                                            "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                redis.call('publish', removedChannelName, msg); " + 
-                                        "end; " +
-                        "            end; " +
-                        "        end; " +
-                        "    end; " +
+                // last access time
+                "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size'));" +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "    local currentTime = tonumber(ARGV[1]); " +
+                "    local lastAccessTimeSetName = KEYS[6]; " +
+                "local mode = redis.call('hget', KEYS[8], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize > maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[2] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                " if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[7]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                            "if mode == 'LFU' then " +
-                                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                            "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
 
-                        "end; "
+                "end; "
 
-                        + "if insertable == true then "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                            + "redis.call('publish', KEYS[4], msg); "
-                            + "return 1;"
-                        + "else "
-                            + "local t, val = struct.unpack('dLc0', v); "
-                            + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3], string.len(val), val); "
-                            + "redis.call('publish', KEYS[5], msg); "
-                            + "return 0;"
-                        + "end;",
-                Arrays.asList(getRawName(key), getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+                + "if insertable == true then "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return 1;"
+                + "else "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3], string.len(val), val); "
+                + "redis.call('publish', KEYS[5], msg); "
+                + "return 0;"
+                + "end;",
+            Arrays.asList(getRawName(key), getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
     @Override
     protected RFuture<Boolean> fastPutIfExistsOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "local lastAccessTimeSetName = KEYS[5]; "
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); "
-                        + "local currentTime = tonumber(ARGV[1]); "
-                        + "if value ~= false then "
-                            + "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
-                            + "redis.call('hset', KEYS[1], ARGV[2], val); "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                            + "redis.call('publish', KEYS[4], msg); "+
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "local lastAccessTimeSetName = KEYS[5]; "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); "
+                + "local currentTime = tonumber(ARGV[1]); "
+                + "if value ~= false then "
+                + "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('hset', KEYS[1], ARGV[2], val); "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('publish', KEYS[4], msg); " +
 
-                            // last access time
+                // last access time
 
-                            "if maxSize ~= nil and maxSize ~= 0 then " +
-                                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                                "end; " +
-                            "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                            "    if cacheSize > maxSize then " +
-                            "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
-                            "        for index, lruItem in ipairs(lruItems) do " +
-                            "            if lruItem and lruItem ~= ARGV[2] then " +
-                            "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                            "                redis.call('hdel', KEYS[1], lruItem); " +
-                            "                redis.call('zrem', KEYS[2], lruItem); " +
-                            "                redis.call('zrem', KEYS[3], lruItem); " +
-                            "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                                           " if lruItemValue ~= false then " +
-                                "                local removedChannelName = KEYS[6]; " +
-                                                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                                "                redis.call('publish', removedChannelName, msg); " +
-                                            "end; " +
-                            "            end; " +
-                            "        end; " +
-                            "    end; " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize > maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[2] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                " if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[6]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                                "if mode == 'LFU' then " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                                "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
 
-                            "end; "
+                "end; "
 
-                            + "return 1; "
-                        + "end; "
+                + "return 1; "
+                + "end; "
 
-                        + "return 0; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+                + "return 0; ",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
     @Override
     protected RFuture<Boolean> fastPutIfAbsentOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); "
-                        + "local lastAccessTimeSetName = KEYS[5]; "
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); "
-                        + "local currentTime = tonumber(ARGV[1]); "
-                        + "if value == false then "
-                            + "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
-                            + "redis.call('hset', KEYS[1], ARGV[2], val); "
-                            + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                            + "redis.call('publish', KEYS[4], msg); "+
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); "
+                + "local lastAccessTimeSetName = KEYS[5]; "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); "
+                + "local currentTime = tonumber(ARGV[1]); "
+                + "if value == false then "
+                + "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('hset', KEYS[1], ARGV[2], val); "
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('publish', KEYS[4], msg); " +
 
-                            // last access time
+                // last access time
 
-                            "if maxSize ~= nil and maxSize ~= 0 then " +
-                                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                                "end; " +
-                            "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                            "    if cacheSize > maxSize then " +
-                            "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
-                            "        for index, lruItem in ipairs(lruItems) do " +
-                            "            if lruItem and lruItem ~= ARGV[2] then " +
-                            "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                            "                redis.call('hdel', KEYS[1], lruItem); " +
-                            "                redis.call('zrem', KEYS[2], lruItem); " +
-                            "                redis.call('zrem', KEYS[3], lruItem); " +
-                            "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                                           " if lruItemValue ~= false then " +
-                                "                local removedChannelName = KEYS[6]; " +
-                                                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                                "                redis.call('publish', removedChannelName, msg); " + 
-                                            "end; " +
-                            "            end; " +
-                            "        end; " +
-                            "    end; " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "end; " +
+                "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "    if cacheSize > maxSize then " +
+                "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1); " +
+                "        for index, lruItem in ipairs(lruItems) do " +
+                "            if lruItem and lruItem ~= ARGV[2] then " +
+                "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                redis.call('hdel', KEYS[1], lruItem); " +
+                "                redis.call('zrem', KEYS[2], lruItem); " +
+                "                redis.call('zrem', KEYS[3], lruItem); " +
+                "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                " if lruItemValue ~= false then " +
+                "                local removedChannelName = KEYS[6]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "            end; " +
+                "        end; " +
+                "    end; " +
 
-                                "if mode == 'LFU' then " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                                "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; " +
 
-                            "end; "
+                "end; "
 
-                            + "return 1; "
-                        + "end; "
+                + "return 1; "
+                + "end; "
 
-                        + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
-                                "else " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
-                                "end; "
-                        + "end; "
-                        + "local t, val = struct.unpack('dLc0', value); "
-                        + "local expireDate = 92233720368547758; "
-                        + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                            + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                    + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
-                                + "end; "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                            + "end; "
-                        + "end; "
-                        + "if expireDate > tonumber(ARGV[1]) then "
-                            + "return 0; "
-                        + "end; "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[2]); " +
+                "else " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[2]); " +
+                "end; "
+                + "end; "
+                + "local t, val = struct.unpack('dLc0', value); "
+                + "local expireDate = 92233720368547758; "
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "return 0; "
+                + "end; "
 
-                        + "redis.call('zrem', KEYS[2], ARGV[2]); "
-                        + "redis.call('zrem', KEYS[3], ARGV[2]); "
-                        + "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
-                        + "redis.call('hset', KEYS[1], ARGV[2], val); "
+                + "redis.call('zrem', KEYS[2], ARGV[2]); "
+                + "redis.call('zrem', KEYS[3], ARGV[2]); "
+                + "local val = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('hset', KEYS[1], ARGV[2], val); "
 
-                        + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
-                        + "redis.call('publish', KEYS[4], msg); "
-                        + "return 1; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3]); "
+                + "redis.call('publish', KEYS[4], msg); "
+                + "return 1; ",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
     @Override
@@ -1879,90 +1912,90 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
 
         String name = getRawName(key);
         RFuture<Boolean> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "local insertable = false; " +
-                        "local value = redis.call('hget', KEYS[1], ARGV[5]); " +
-                        "if value == false then " +
-                        "    insertable = true; " +
-                        "else " +
-                        "    if insertable == false then " +
-                        "        local t, val = struct.unpack('dLc0', value); " +
-                        "        local expireDate = 92233720368547758; " +
-                        "        local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); " +
-                        "        if expireDateScore ~= false then " +
-                        "            expireDate = tonumber(expireDateScore) " +
-                        "        end; " +
-                        "        if t ~= 0 then " +
-                        "            local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); " +
-                        "            if expireIdle ~= false then " +
-                        "                expireDate = math.min(expireDate, tonumber(expireIdle)) " +
-                        "            end; " +
-                        "        end; " +
-                        "        if expireDate <= tonumber(ARGV[1]) then " +
-                        "            insertable = true; " +
-                        "        end; " +
-                        "    end; " +
-                        "end; " +
-                        "if insertable == true then " +
-                             // ttl
-                        "    if tonumber(ARGV[2]) > 0 then " +
-                        "        redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); " +
-                        "    else " +
-                        "        redis.call('zrem', KEYS[2], ARGV[5]); " +
-                        "    end; " +
-                             // idle
-                        "    if tonumber(ARGV[3]) > 0 then " +
-                        "        redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); " +
-                        "    else " +
-                        "        redis.call('zrem', KEYS[3], ARGV[5]); " +
-                        "    end; " +
-                             // last access time
-                        "    local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); " +
-                        "    if maxSize ~= nil and maxSize ~= 0 then " +
-                        "        local currentTime = tonumber(ARGV[1]); " +
-                        "        local lastAccessTimeSetName = KEYS[5]; " +
+            "local insertable = false; " +
+                "local value = redis.call('hget', KEYS[1], ARGV[5]); " +
+                "if value == false then " +
+                "    insertable = true; " +
+                "else " +
+                "    if insertable == false then " +
+                "        local t, val = struct.unpack('dLc0', value); " +
+                "        local expireDate = 92233720368547758; " +
+                "        local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); " +
+                "        if expireDateScore ~= false then " +
+                "            expireDate = tonumber(expireDateScore) " +
+                "        end; " +
+                "        if t ~= 0 then " +
+                "            local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); " +
+                "            if expireIdle ~= false then " +
+                "                expireDate = math.min(expireDate, tonumber(expireIdle)) " +
+                "            end; " +
+                "        end; " +
+                "        if expireDate <= tonumber(ARGV[1]) then " +
+                "            insertable = true; " +
+                "        end; " +
+                "    end; " +
+                "end; " +
+                "if insertable == true then " +
+                // ttl
+                "    if tonumber(ARGV[2]) > 0 then " +
+                "        redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); " +
+                "    else " +
+                "        redis.call('zrem', KEYS[2], ARGV[5]); " +
+                "    end; " +
+                // idle
+                "    if tonumber(ARGV[3]) > 0 then " +
+                "        redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); " +
+                "    else " +
+                "        redis.call('zrem', KEYS[3], ARGV[5]); " +
+                "    end; " +
+                // last access time
+                "    local maxSize = tonumber(redis.call('hget', KEYS[7], 'max-size')); " +
+                "    if maxSize ~= nil and maxSize ~= 0 then " +
+                "        local currentTime = tonumber(ARGV[1]); " +
+                "        local lastAccessTimeSetName = KEYS[5]; " +
 
-                                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
-                                "end; " +
+                "local mode = redis.call('hget', KEYS[7], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
+                "end; " +
 
-                        "        local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                        "        if cacheSize >= maxSize then " +
-                        "            local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
-                        "            for index, lruItem in ipairs(lruItems) do " +
-                        "                if lruItem and lruItem ~= ARGV[5] then " +
-                        "                    local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
-                        "                    redis.call('hdel', KEYS[1], lruItem); " +
-                        "                    redis.call('zrem', KEYS[2], lruItem); " +
-                        "                    redis.call('zrem', KEYS[3], lruItem); " +
-                        "                    redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                                           " if lruItemValue ~= false then " +
-                            "                    local removedChannelName = KEYS[6]; " +
-                                                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                    redis.call('publish', removedChannelName, msg); " + 
-                                            "end; " +
-                        "                end; " +
-                        "            end; " +
-                        "        end; " +
+                "        local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                "        if cacheSize >= maxSize then " +
+                "            local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
+                "            for index, lruItem in ipairs(lruItems) do " +
+                "                if lruItem and lruItem ~= ARGV[5] then " +
+                "                    local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                "                    redis.call('hdel', KEYS[1], lruItem); " +
+                "                    redis.call('zrem', KEYS[2], lruItem); " +
+                "                    redis.call('zrem', KEYS[3], lruItem); " +
+                "                    redis.call('zrem', lastAccessTimeSetName, lruItem); " +
+                " if lruItemValue ~= false then " +
+                "                    local removedChannelName = KEYS[6]; " +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                    redis.call('publish', removedChannelName, msg); " +
+                "end; " +
+                "                end; " +
+                "            end; " +
+                "        end; " +
 
-                                "if mode == 'LFU' then " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
-                                "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
+                "end; " +
 
-                        "    end; " +
-                             // value
-                        "    local val = struct.pack('dLc0', ARGV[4], string.len(ARGV[6]), ARGV[6]); " +
-                        "    redis.call('hset', KEYS[1], ARGV[5], val); " +
-                        "    local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); " +
-                        "    redis.call('publish', KEYS[4], msg); " +
-                        "    return 1; " +
-                        "else " +
-                        "    return 0; " +
-                        "end; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
-                        getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
-                System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
+                "    end; " +
+                // value
+                "    local val = struct.pack('dLc0', ARGV[4], string.len(ARGV[6]), ARGV[6]); " +
+                "    redis.call('hset', KEYS[1], ARGV[5], val); " +
+                "    local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); " +
+                "    redis.call('publish', KEYS[4], msg); " +
+                "    return 1; " +
+                "else " +
+                "    return 0; " +
+                "end; ",
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
+                getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
+            System.currentTimeMillis(), ttlTimeout, maxIdleTimeout, maxIdleDelta, encodeMapKey(key), encodeMapValue(value));
         if (hasNoWriter()) {
             return future;
         }
@@ -1976,34 +2009,34 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
             "local v = redis.call('hget', KEYS[1], ARGV[2]); " +
-            "if v == false then " +
-            "    return 0; " +
-            "end; " +
-            "local expireDate = 92233720368547758; " +
-            "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); " +
-            "if expireDateScore ~= false then " +
-            "    expireDate = tonumber(expireDateScore) " +
-            "end; " +
-            "" +
-            "local t, val = struct.unpack('dLc0', v); " +
-            "if t ~= 0 then " +
-            "    local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); " +
-            "    if tonumber(expireIdle) > tonumber(ARGV[1]) then " +
-            "        redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); " +
-            "    end ;" +
-            "    if expireIdle ~= false then " +
-            "        expireDate = math.min(expireDate, tonumber(expireIdle)) " +
-            "    end; " +
-            "end; " +
-            "if expireDate > tonumber(ARGV[1]) and val == ARGV[3] then " +
-            "    local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[4]), ARGV[4], string.len(ARGV[3]), ARGV[3]); " +
-            "    redis.call('publish', KEYS[4], msg); " +
-            "" +
-            "    local value = struct.pack('dLc0', t, string.len(ARGV[4]), ARGV[4]); " +
-            "    redis.call('hset', KEYS[1], ARGV[2], value); " +
-            "    return 1; " +
-            "end; " +
-            "return 0; ",
+                "if v == false then " +
+                "    return 0; " +
+                "end; " +
+                "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); " +
+                "if expireDateScore ~= false then " +
+                "    expireDate = tonumber(expireDateScore) " +
+                "end; " +
+                "" +
+                "local t, val = struct.unpack('dLc0', v); " +
+                "if t ~= 0 then " +
+                "    local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); " +
+                "    if tonumber(expireIdle) > tonumber(ARGV[1]) then " +
+                "        redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); " +
+                "    end ;" +
+                "    if expireIdle ~= false then " +
+                "        expireDate = math.min(expireDate, tonumber(expireIdle)) " +
+                "    end; " +
+                "end; " +
+                "if expireDate > tonumber(ARGV[1]) and val == ARGV[3] then " +
+                "    local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[4]), ARGV[4], string.len(ARGV[3]), ARGV[3]); " +
+                "    redis.call('publish', KEYS[4], msg); " +
+                "" +
+                "    local value = struct.pack('dLc0', t, string.len(ARGV[4]), ARGV[4]); " +
+                "    redis.call('hset', KEYS[1], ARGV[2], value); " +
+                "    return 1; " +
+                "end; " +
+                "return 0; ",
             Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getUpdatedChannelName(name)),
             System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(oldValue), encodeMapValue(newValue));
     }
@@ -2012,7 +2045,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<Boolean> fastReplaceOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); " +
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); " +
                 "if value == false then " +
                 "    return 0; " +
                 "end; " +
@@ -2039,15 +2072,15 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3], string.len(val), val); " +
                 "redis.call('publish', KEYS[4], msg); " +
                 "return 1; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getUpdatedChannelName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getUpdatedChannelName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
-    
+
     @Override
     protected RFuture<V> replaceOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "local value = redis.call('hget', KEYS[1], ARGV[2]); " +
+            "local value = redis.call('hget', KEYS[1], ARGV[2]); " +
                 "if value == false then " +
                 "    return nil; " +
                 "end; " +
@@ -2074,13 +2107,13 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[2]), ARGV[2], string.len(ARGV[3]), ARGV[3], string.len(val), val); " +
                 "redis.call('publish', KEYS[4], msg); " +
                 "return val; ",
-                Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getUpdatedChannelName(name)),
-                System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
+            Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getUpdatedChannelName(name)),
+            System.currentTimeMillis(), encodeMapKey(key), encodeMapValue(value));
     }
 
     @Override
     protected RFuture<Void> putAllOperationAsync(Map<? extends K, ? extends V> map) {
-        List<Object> params = new ArrayList<Object>(map.size()*2 + 1);
+        List<Object> params = new ArrayList<Object>(map.size() * 2 + 1);
         params.add(System.currentTimeMillis());
         for (java.util.Map.Entry<? extends K, ? extends V> t : map.entrySet()) {
             if (t.getKey() == null) {
@@ -2095,92 +2128,92 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         }
 
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_VOID,
-                  "local currentTime = tonumber(table.remove(ARGV, 1)); " + // index is the first parameter
-                  "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size'));" +
-                  "local mode = redis.call('hget', KEYS[8], 'mode'); " +
-                  "for i, value in ipairs(ARGV) do "
-                    + "if i % 2 == 0 then " 
-                      + "local key = ARGV[i-1];" +
+            "local currentTime = tonumber(table.remove(ARGV, 1)); " + // index is the first parameter
+                "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size'));" +
+                "local mode = redis.call('hget', KEYS[8], 'mode'); " +
+                "for i, value in ipairs(ARGV) do "
+                + "if i % 2 == 0 then "
+                + "local key = ARGV[i-1];" +
 
-                        "local v = redis.call('hget', KEYS[1], key);" +
-                        "local exists = false;" +
-                        "if v ~= false then" +
-                        "    local t, val = struct.unpack('dLc0', v);" +
-                        "    local expireDate = 92233720368547758;" +
-                        "    local expireDateScore = redis.call('zscore', KEYS[2], key);" +
-                        "    if expireDateScore ~= false then" +
-                        "        expireDate = tonumber(expireDateScore)" +
-                        "    end;" +
-                        "    if t ~= 0 then" +
-                        "        local expireIdle = redis.call('zscore', KEYS[3], key);" +
-                        "        if expireIdle ~= false then" +
-                        "            expireDate = math.min(expireDate, tonumber(expireIdle))" +
-                        "        end;" +
-                        "    end;" +
-                        "    if expireDate > tonumber(currentTime) then" +
-                        "        exists = true;" +
-                        "    end;" +
-                        "end;" +
-                        "" +
-                        "local newvalue = struct.pack('dLc0', 0, string.len(value), value);" +
-                        "redis.call('hset', KEYS[1], key, newvalue);" +
+                "local v = redis.call('hget', KEYS[1], key);" +
+                "local exists = false;" +
+                "if v ~= false then" +
+                "    local t, val = struct.unpack('dLc0', v);" +
+                "    local expireDate = 92233720368547758;" +
+                "    local expireDateScore = redis.call('zscore', KEYS[2], key);" +
+                "    if expireDateScore ~= false then" +
+                "        expireDate = tonumber(expireDateScore)" +
+                "    end;" +
+                "    if t ~= 0 then" +
+                "        local expireIdle = redis.call('zscore', KEYS[3], key);" +
+                "        if expireIdle ~= false then" +
+                "            expireDate = math.min(expireDate, tonumber(expireIdle))" +
+                "        end;" +
+                "    end;" +
+                "    if expireDate > tonumber(currentTime) then" +
+                "        exists = true;" +
+                "    end;" +
+                "end;" +
+                "" +
+                "local newvalue = struct.pack('dLc0', 0, string.len(value), value);" +
+                "redis.call('hset', KEYS[1], key, newvalue);" +
 
-                        "local lastAccessTimeSetName = KEYS[6];" +
-                        "if exists == false then" +
-                        "    if maxSize ~= nil and maxSize ~= 0 then " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
-                                "end; " +
+                "local lastAccessTimeSetName = KEYS[6];" +
+                "if exists == false then" +
+                "    if maxSize ~= nil and maxSize ~= 0 then " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
+                "end; " +
 
-                        "        local cacheSize = tonumber(redis.call('hlen', KEYS[1]));" +
-                        "        if cacheSize > maxSize then" +
-                        "            local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1);" +
-                        "            for index, lruItem in ipairs(lruItems) do" +
-                        "                if lruItem and lruItem ~= key then" +
-                        "                    local lruItemValue = redis.call('hget', KEYS[1], lruItem);" +
-                        "                    redis.call('hdel', KEYS[1], lruItem);" +
-                        "                    redis.call('zrem', KEYS[2], lruItem);" +
-                        "                    redis.call('zrem', KEYS[3], lruItem);" +
-                        "                    redis.call('zrem', lastAccessTimeSetName, lruItem);" +
-                                           " if lruItemValue ~= false then " +
-                            "                    local removedChannelName = KEYS[7];" +
-                                                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                    redis.call('publish', removedChannelName, msg);"
-                                          + "end; " +
-                        "                end;" +
-                        "            end" +
-                        "        end;" +
+                "        local cacheSize = tonumber(redis.call('hlen', KEYS[1]));" +
+                "        if cacheSize > maxSize then" +
+                "            local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1);" +
+                "            for index, lruItem in ipairs(lruItems) do" +
+                "                if lruItem and lruItem ~= key then" +
+                "                    local lruItemValue = redis.call('hget', KEYS[1], lruItem);" +
+                "                    redis.call('hdel', KEYS[1], lruItem);" +
+                "                    redis.call('zrem', KEYS[2], lruItem);" +
+                "                    redis.call('zrem', KEYS[3], lruItem);" +
+                "                    redis.call('zrem', lastAccessTimeSetName, lruItem);" +
+                " if lruItemValue ~= false then " +
+                "                    local removedChannelName = KEYS[7];" +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                    redis.call('publish', removedChannelName, msg);"
+                + "end; " +
+                "                end;" +
+                "            end" +
+                "        end;" +
 
-                                "if mode == 'LFU' then " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
-                                "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
+                "end; " +
 
-                        "    end;" +
-                        "    local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(value), value);" +
-                        "    redis.call('publish', KEYS[4], msg);" +
-                        "else " +
-                            "local t, val = struct.unpack('dLc0', v);" +
-                            "local msg = struct.pack('Lc0Lc0Lc0', string.len(key), key, string.len(value), value, string.len(val), val);" +
-                            "redis.call('publish', KEYS[5], msg);" + 
-                            
-                        "    if maxSize ~= nil and maxSize ~= 0 then " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
-                                "else " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
-                                "end; " +
-                        "    end;" +
-                        "end;"
-                    + "end;"
+                "    end;" +
+                "    local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(value), value);" +
+                "    redis.call('publish', KEYS[4], msg);" +
+                "else " +
+                "local t, val = struct.unpack('dLc0', v);" +
+                "local msg = struct.pack('Lc0Lc0Lc0', string.len(key), key, string.len(value), value, string.len(val), val);" +
+                "redis.call('publish', KEYS[5], msg);" +
+
+                "    if maxSize ~= nil and maxSize ~= 0 then " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
+                "else " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
+                "end; " +
+                "    end;" +
+                "end;"
+                + "end;"
                 + "end;",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getCreatedChannelName(),
-                        getUpdatedChannelName(), getLastAccessTimeSetName(), getRemovedChannelName(), getOptionsName()),
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getCreatedChannelName(),
+                getUpdatedChannelName(), getLastAccessTimeSetName(), getRemovedChannelName(), getOptionsName()),
             params.toArray());
     }
-    
+
     private RFuture<Void> putAllOperationAsync(Map<? extends K, ? extends V> map, long ttl, TimeUnit ttlUnit) {
-        List<Object> params = new ArrayList<Object>(map.size()*2 + 2);
+        List<Object> params = new ArrayList<Object>(map.size() * 2 + 2);
         params.add(System.currentTimeMillis());
         long ttlTimeout = 0;
         if (ttl > 0) {
@@ -2200,106 +2233,106 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         }
 
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_VOID,
-                  "local currentTime = tonumber(table.remove(ARGV, 1)); " + // index is the first parameter
-                  "local ttl = table.remove(ARGV, 1); " + // ttl is the second parameter
-                  "local ttlNumber = tonumber(ttl); " +
-                  "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size'));" +
-                  "local mode = redis.call('hget', KEYS[8], 'mode'); " +
-                  "for i, value in ipairs(ARGV) do "
-                    + "if i % 2 == 0 then " 
-                      + "local key = ARGV[i-1];" +
+            "local currentTime = tonumber(table.remove(ARGV, 1)); " + // index is the first parameter
+                "local ttl = table.remove(ARGV, 1); " + // ttl is the second parameter
+                "local ttlNumber = tonumber(ttl); " +
+                "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size'));" +
+                "local mode = redis.call('hget', KEYS[8], 'mode'); " +
+                "for i, value in ipairs(ARGV) do "
+                + "if i % 2 == 0 then "
+                + "local key = ARGV[i-1];" +
 
-                        "local v = redis.call('hget', KEYS[1], key);" +
-                        "local exists = false;" +
-                        "if v ~= false then" +
-                        "    local t, val = struct.unpack('dLc0', v);" +
-                        "    local expireDate = 92233720368547758;" +
-                        "    local expireDateScore = redis.call('zscore', KEYS[2], key);" +
-                        "    if expireDateScore ~= false then" +
-                        "        expireDate = tonumber(expireDateScore)" +
-                        "    end;" +
-                        "    if t ~= 0 then" +
-                        "        local expireIdle = redis.call('zscore', KEYS[3], key);" +
-                        "        if expireIdle ~= false then" +
-                        "            expireDate = math.min(expireDate, tonumber(expireIdle))" +
-                        "        end;" +
-                        "    end;" +
-                        "    if expireDate > tonumber(currentTime) then" +
-                        "        exists = true;" +
-                        "    end;" +
-                        "end;" +
-                        "" +
-                        "if ttlNumber > 0 then " +
-                        "    redis.call('zadd', KEYS[2], ttl, key); " +
-                        "else " +
-                        "    redis.call('zrem', KEYS[2], key); " +
-                        "end; " +
-                        "" +
-                        "local newvalue = struct.pack('dLc0', 0, string.len(value), value);" +
-                        "redis.call('hset', KEYS[1], key, newvalue);" +
+                "local v = redis.call('hget', KEYS[1], key);" +
+                "local exists = false;" +
+                "if v ~= false then" +
+                "    local t, val = struct.unpack('dLc0', v);" +
+                "    local expireDate = 92233720368547758;" +
+                "    local expireDateScore = redis.call('zscore', KEYS[2], key);" +
+                "    if expireDateScore ~= false then" +
+                "        expireDate = tonumber(expireDateScore)" +
+                "    end;" +
+                "    if t ~= 0 then" +
+                "        local expireIdle = redis.call('zscore', KEYS[3], key);" +
+                "        if expireIdle ~= false then" +
+                "            expireDate = math.min(expireDate, tonumber(expireIdle))" +
+                "        end;" +
+                "    end;" +
+                "    if expireDate > tonumber(currentTime) then" +
+                "        exists = true;" +
+                "    end;" +
+                "end;" +
+                "" +
+                "if ttlNumber > 0 then " +
+                "    redis.call('zadd', KEYS[2], ttl, key); " +
+                "else " +
+                "    redis.call('zrem', KEYS[2], key); " +
+                "end; " +
+                "" +
+                "local newvalue = struct.pack('dLc0', 0, string.len(value), value);" +
+                "redis.call('hset', KEYS[1], key, newvalue);" +
 
-                        "local lastAccessTimeSetName = KEYS[6];" +
-                        "if exists == false then" +
-                        "    if maxSize ~= nil and maxSize ~= 0 then " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
-                                "end; " +
+                "local lastAccessTimeSetName = KEYS[6];" +
+                "if exists == false then" +
+                "    if maxSize ~= nil and maxSize ~= 0 then " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
+                "end; " +
 
-                        "        local cacheSize = tonumber(redis.call('hlen', KEYS[1]));" +
-                        "        if cacheSize > maxSize then" +
-                        "            local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1);" +
-                        "            for index, lruItem in ipairs(lruItems) do" +
-                        "                if lruItem and lruItem ~= key then" +
-                        "                    local lruItemValue = redis.call('hget', KEYS[1], lruItem);" +
-                        "                    redis.call('hdel', KEYS[1], lruItem);" +
-                        "                    redis.call('zrem', KEYS[2], lruItem);" +
-                        "                    redis.call('zrem', KEYS[3], lruItem);" +
-                        "                    redis.call('zrem', lastAccessTimeSetName, lruItem);" +
-                                           " if lruItemValue ~= false then " +
-                            "                    local removedChannelName = KEYS[7];" +
-                                                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                            "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                            "                    redis.call('publish', removedChannelName, msg);"
-                                          + "end; " +
-                        "                end;" +
-                        "            end" +
-                        "        end;" +
+                "        local cacheSize = tonumber(redis.call('hlen', KEYS[1]));" +
+                "        if cacheSize > maxSize then" +
+                "            local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize - 1);" +
+                "            for index, lruItem in ipairs(lruItems) do" +
+                "                if lruItem and lruItem ~= key then" +
+                "                    local lruItemValue = redis.call('hget', KEYS[1], lruItem);" +
+                "                    redis.call('hdel', KEYS[1], lruItem);" +
+                "                    redis.call('zrem', KEYS[2], lruItem);" +
+                "                    redis.call('zrem', KEYS[3], lruItem);" +
+                "                    redis.call('zrem', lastAccessTimeSetName, lruItem);" +
+                " if lruItemValue ~= false then " +
+                "                    local removedChannelName = KEYS[7];" +
+                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                "                    redis.call('publish', removedChannelName, msg);"
+                + "end; " +
+                "                end;" +
+                "            end" +
+                "        end;" +
 
-                                "if mode == 'LFU' then " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
-                                "end; " +
+                "if mode == 'LFU' then " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
+                "end; " +
 
-                        "    end;" +
-                        "    local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(value), value);" +
-                        "    redis.call('publish', KEYS[4], msg);" +
-                        "else " +
-                            "local t, val = struct.unpack('dLc0', v);" +
-                            "local msg = struct.pack('Lc0Lc0Lc0', string.len(key), key, string.len(value), value, string.len(val), val);" +
-                            "redis.call('publish', KEYS[5], msg);" + 
-                            
-                        "    if maxSize ~= nil and maxSize ~= 0 then " +
-                                "if mode == false or mode == 'LRU' then " +
-                                    "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
-                                "else " +
-                                    "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
-                                "end; " +
-                        "    end;" +
-                        "end;"
-                    + "end;"
+                "    end;" +
+                "    local msg = struct.pack('Lc0Lc0', string.len(key), key, string.len(value), value);" +
+                "    redis.call('publish', KEYS[4], msg);" +
+                "else " +
+                "local t, val = struct.unpack('dLc0', v);" +
+                "local msg = struct.pack('Lc0Lc0Lc0', string.len(key), key, string.len(value), value, string.len(val), val);" +
+                "redis.call('publish', KEYS[5], msg);" +
+
+                "    if maxSize ~= nil and maxSize ~= 0 then " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', lastAccessTimeSetName, currentTime, key); " +
+                "else " +
+                "redis.call('zincrby', lastAccessTimeSetName, 1, key); " +
+                "end; " +
+                "    end;" +
+                "end;"
+                + "end;"
                 + "end;",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getCreatedChannelName(),
-                        getUpdatedChannelName(), getLastAccessTimeSetName(), getRemovedChannelName(), getOptionsName()),
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getCreatedChannelName(),
+                getUpdatedChannelName(), getLastAccessTimeSetName(), getRemovedChannelName(), getOptionsName()),
             params.toArray());
     }
 
     private MapCacheEventCodec.OSType osType;
-    
+
     @Override
     public int addListener(MapEntryListener listener) {
         if (listener == null) {
             throw new NullPointerException();
         }
-        
+
         if (osType == null) {
             RFuture<Map<String, String>> serverFuture = commandExecutor.readAsync((String) null, StringCodec.INSTANCE, RedisCommands.INFO_SERVER);
             String os = serverFuture.toCompletableFuture().join().get("os");
@@ -2360,7 +2393,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     @Override
     public void removeListener(int listenerId) {
         super.removeListener(listenerId);
-        
+
         RTopic removedTopic = redisson.getTopic(getRemovedChannelName());
         removedTopic.removeListener(listenerId);
 
@@ -2394,162 +2427,162 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     @Override
     public RFuture<Boolean> expireAsync(long timeToLive, TimeUnit timeUnit, String param, String... keys) {
         return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then "
-                            + "redis.call('zadd', KEYS[4], 92233720368547758, 'redisson__expiretag'); "
-                            + "if ARGV[2] ~= '' then "
-                                + "redis.call('pexpire', KEYS[5], ARGV[1], ARGV[2]); "
-                                + "redis.call('pexpire', KEYS[4], ARGV[1], ARGV[2]); "
-                            + "else "
-                                + "redis.call('pexpire', KEYS[5], ARGV[1]); "
-                                + "redis.call('pexpire', KEYS[4], ARGV[1]); "
-                            + "end; "
-                      + "end; " +
-                        "redis.call('zadd', KEYS[2], 92233720368547758, 'redisson__expiretag'); " +
-                        "redis.call('zadd', KEYS[3], 92233720368547758, 'redisson__expiretag'); " +
-                        "if ARGV[2] ~= '' then "
-                            + "redis.call('pexpire', KEYS[2], ARGV[1], ARGV[2]); "
-                            + "redis.call('pexpire', KEYS[3], ARGV[1], ARGV[2]); "
-                            + "return redis.call('pexpireat', KEYS[1], ARGV[1], ARGV[2]); "
-                       + "end; "
-                       + "redis.call('pexpire', KEYS[2], ARGV[1]); "
-                       + "redis.call('pexpire', KEYS[3], ARGV[1]); "
-                       + "return redis.call('pexpire', KEYS[1], ARGV[1]); ",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                timeUnit.toMillis(timeToLive), param);
+            "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then "
+                + "redis.call('zadd', KEYS[4], 92233720368547758, 'redisson__expiretag'); "
+                + "if ARGV[2] ~= '' then "
+                + "redis.call('pexpire', KEYS[5], ARGV[1], ARGV[2]); "
+                + "redis.call('pexpire', KEYS[4], ARGV[1], ARGV[2]); "
+                + "else "
+                + "redis.call('pexpire', KEYS[5], ARGV[1]); "
+                + "redis.call('pexpire', KEYS[4], ARGV[1]); "
+                + "end; "
+                + "end; " +
+                "redis.call('zadd', KEYS[2], 92233720368547758, 'redisson__expiretag'); " +
+                "redis.call('zadd', KEYS[3], 92233720368547758, 'redisson__expiretag'); " +
+                "if ARGV[2] ~= '' then "
+                + "redis.call('pexpire', KEYS[2], ARGV[1], ARGV[2]); "
+                + "redis.call('pexpire', KEYS[3], ARGV[1], ARGV[2]); "
+                + "return redis.call('pexpireat', KEYS[1], ARGV[1], ARGV[2]); "
+                + "end; "
+                + "redis.call('pexpire', KEYS[2], ARGV[1]); "
+                + "redis.call('pexpire', KEYS[3], ARGV[1]); "
+                + "return redis.call('pexpire', KEYS[1], ARGV[1]); ",
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            timeUnit.toMillis(timeToLive), param);
     }
 
     @Override
     protected RFuture<Boolean> expireAtAsync(long timestamp, String param, String... keys) {
         return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                        "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then "
-                                + "redis.call('zadd', KEYS[4], 92233720368547758, 'redisson__expiretag'); "
-                                + "if ARGV[2] ~= '' then "
-                                    + "redis.call('pexpireat', KEYS[5], ARGV[1], ARGV[2]); "
-                                    + "redis.call('pexpireat', KEYS[4], ARGV[1], ARGV[2]); "
-                                + "else "
-                                    + "redis.call('pexpireat', KEYS[5], ARGV[1]); "
-                                    + "redis.call('pexpireat', KEYS[4], ARGV[1]); "
-                                + "end; "
-                       + "end; "
-                       + "redis.call('zadd', KEYS[2], 92233720368547758, 'redisson__expiretag'); "
-                       + "redis.call('zadd', KEYS[3], 92233720368547758, 'redisson__expiretag'); "
-                       + "if ARGV[2] ~= '' then "
-                            + "redis.call('pexpireat', KEYS[2], ARGV[1], ARGV[2]); "
-                            + "redis.call('pexpireat', KEYS[3], ARGV[1], ARGV[2]); "
-                            + "return redis.call('pexpireat', KEYS[1], ARGV[1], ARGV[2]); "
-                       + "end; "
-                       + "redis.call('pexpireat', KEYS[2], ARGV[1]); "
-                       + "redis.call('pexpireat', KEYS[3], ARGV[1]); "
-                       + "return redis.call('pexpireat', KEYS[1], ARGV[1]); ",
-                Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                timestamp, param);
+            "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then "
+                + "redis.call('zadd', KEYS[4], 92233720368547758, 'redisson__expiretag'); "
+                + "if ARGV[2] ~= '' then "
+                + "redis.call('pexpireat', KEYS[5], ARGV[1], ARGV[2]); "
+                + "redis.call('pexpireat', KEYS[4], ARGV[1], ARGV[2]); "
+                + "else "
+                + "redis.call('pexpireat', KEYS[5], ARGV[1]); "
+                + "redis.call('pexpireat', KEYS[4], ARGV[1]); "
+                + "end; "
+                + "end; "
+                + "redis.call('zadd', KEYS[2], 92233720368547758, 'redisson__expiretag'); "
+                + "redis.call('zadd', KEYS[3], 92233720368547758, 'redisson__expiretag'); "
+                + "if ARGV[2] ~= '' then "
+                + "redis.call('pexpireat', KEYS[2], ARGV[1], ARGV[2]); "
+                + "redis.call('pexpireat', KEYS[3], ARGV[1], ARGV[2]); "
+                + "return redis.call('pexpireat', KEYS[1], ARGV[1], ARGV[2]); "
+                + "end; "
+                + "redis.call('pexpireat', KEYS[2], ARGV[1]); "
+                + "redis.call('pexpireat', KEYS[3], ARGV[1]); "
+                + "return redis.call('pexpireat', KEYS[1], ARGV[1]); ",
+            Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            timestamp, param);
     }
 
     @Override
     public RFuture<Boolean> clearExpireAsync() {
         return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                        "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
-                        "if maxSize ~= nil and maxSize ~= 0 then " +
-                        "    redis.call('persist', KEYS[5]); " +
-                        "    redis.call('zrem', KEYS[4], 92233720368547758, 'redisson__expiretag'); " +
-                        "    redis.call('persist', KEYS[4]); " +
-                        "end; " +
-                
-                        "redis.call('zrem', KEYS[2], 'redisson__expiretag'); " +
-                        "redis.call('persist', KEYS[2]); " +
-                        "redis.call('zrem', KEYS[3], 'redisson__expiretag'); " +
-                        "redis.call('persist', KEYS[3]); " +
-                        "return redis.call('persist', KEYS[1]); ",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()));
+            "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
+                "if maxSize ~= nil and maxSize ~= 0 then " +
+                "    redis.call('persist', KEYS[5]); " +
+                "    redis.call('zrem', KEYS[4], 92233720368547758, 'redisson__expiretag'); " +
+                "    redis.call('persist', KEYS[4]); " +
+                "end; " +
+
+                "redis.call('zrem', KEYS[2], 'redisson__expiretag'); " +
+                "redis.call('persist', KEYS[2]); " +
+                "redis.call('zrem', KEYS[3], 'redisson__expiretag'); " +
+                "redis.call('persist', KEYS[3]); " +
+                "return redis.call('persist', KEYS[1]); ",
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()));
     }
 
     @Override
     public RFuture<Set<K>> readAllKeySetAsync() {
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_KEY_SET,
-                "local s = redis.call('hgetall', KEYS[1]); " + 
+            "local s = redis.call('hgetall', KEYS[1]); " +
                 "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));"
-                        + "local result = {}; "
-                        + "for i, v in ipairs(s) do "
-                            + "if i % 2 == 0 then "
-                                + "local t, val = struct.unpack('dLc0', v); "
-                                + "local key = s[i-1];" +
-                                "local expireDate = 92233720368547758; " +
-                                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
-                                + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                                + "end; "
-                                + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
-                                + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                    + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
-                                    + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                        "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                                        "if mode == false or mode == 'LRU' then " +
-                                            "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
-                                        "else " +
-                                            "redis.call('zincrby', KEYS[4], 1, key); " +
-                                        "end; "
-                                    + "end; "
-                                + "end; "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                                + "end; "
-                                + "if expireDate > tonumber(ARGV[1]) then "
-                                    + "table.insert(result, key); "
-                                + "end; "
-                            + "end; "
-                        + "end;" +
-                        "return result;",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                System.currentTimeMillis());
+                + "local result = {}; "
+                + "for i, v in ipairs(s) do "
+                + "if i % 2 == 0 then "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local key = s[i-1];" +
+                "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
+                "else " +
+                "redis.call('zincrby', KEYS[4], 1, key); " +
+                "end; "
+                + "end; "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "table.insert(result, key); "
+                + "end; "
+                + "end; "
+                + "end;" +
+                "return result;",
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            System.currentTimeMillis());
     }
 
     @Override
     public RFuture<Set<K>> randomKeysAsync(int count) {
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_KEY_SET,
             "local s = redis.call('hrandfield', KEYS[1], ARGV[2], 'withvalues'); " +
-                  "if s == false then " +
-                       "return {};" +
-                  "end; " +
-                  "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));"
-                        + "local result = {}; "
-                        + "for i, v in ipairs(s) do "
-                            + "if i % 2 == 0 then "
-                                + "local t, val = struct.unpack('dLc0', v); "
-                                + "local key = s[i-1];" +
-                                "local expireDate = 92233720368547758; " +
-                                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
-                                + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                                + "end; "
-                                + "if t ~= 0 then "
-                                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
-                                + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                    + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
-                                    + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                        "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                                        "if mode == false or mode == 'LRU' then " +
-                                            "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
-                                        "else " +
-                                            "redis.call('zincrby', KEYS[4], 1, key); " +
-                                        "end; "
-                                    + "end; "
-                                + "end; "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                + "end; "
-                                + "end; "
-                                + "if expireDate > tonumber(ARGV[1]) then "
-                                    + "table.insert(result, key); "
-                                + "end; "
-                            + "end; "
-                        + "end;" +
-                        "return result;",
-                Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                System.currentTimeMillis(), count);
+                "if s == false then " +
+                "return {};" +
+                "end; " +
+                "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));"
+                + "local result = {}; "
+                + "for i, v in ipairs(s) do "
+                + "if i % 2 == 0 then "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local key = s[i-1];" +
+                "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
+                "else " +
+                "redis.call('zincrby', KEYS[4], 1, key); " +
+                "end; "
+                + "end; "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "table.insert(result, key); "
+                + "end; "
+                + "end; "
+                + "end;" +
+                "return result;",
+            Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            System.currentTimeMillis(), count);
     }
 
     @Override
@@ -2557,45 +2590,45 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP,
             "local s = redis.call('hrandfield', KEYS[1], ARGV[2], 'withvalues'); " +
                 "if s == false then " +
-                    "return {};" +
+                "return {};" +
                 "end; "
                 + "local result = {}; "
                 + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));"
                 + "for i, v in ipairs(s) do "
-                    + "if i % 2 == 0 then "
-                      + "local t, val = struct.unpack('dLc0', v); "
-                      + "local key = s[i-1];" +
-                        "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], key); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], key); "
-                            + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                    + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
-                                            + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                                    "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                                                    "if mode == false or mode == 'LRU' then " +
-                                                        "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
-                                                    "else " +
-                                                        "redis.call('zincrby', KEYS[4], 1, key); " +
-                                                    "end; "
-                                            + "end; "
-                                        + "end; "
-                                        + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                    + "end; "
-                                + "end; "
-                                + "if expireDate > tonumber(ARGV[1]) then "
-                                    + "table.insert(result, key); "
-                                    + "table.insert(result, val); "
-                                + "end; "
-                            + "end; "
-                        + "end;" +
-                        "return result;",
-                Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                System.currentTimeMillis(), count);
+                + "if i % 2 == 0 then "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local key = s[i-1];" +
+                "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
+                "else " +
+                "redis.call('zincrby', KEYS[4], 1, key); " +
+                "end; "
+                + "end; "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "table.insert(result, key); "
+                + "table.insert(result, val); "
+                + "end; "
+                + "end; "
+                + "end;" +
+                "return result;",
+            Arrays.asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            System.currentTimeMillis(), count);
     }
 
     @Override
@@ -2605,44 +2638,44 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
 
     private <R> RFuture<R> readAll(RedisCommand<?> evalCommandType) {
         return commandExecutor.evalWriteAsync(getRawName(), codec, evalCommandType,
-                "local s = redis.call('hgetall', KEYS[1]); "
-                        + "local result = {}; "
-                        + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));"
+            "local s = redis.call('hgetall', KEYS[1]); "
+                + "local result = {}; "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size'));"
                 + "for i, v in ipairs(s) do "
-                    + "if i % 2 == 0 then "
-                      + "local t, val = struct.unpack('dLc0', v); "
-                      + "local key = s[i-1];" +
-                        "local expireDate = 92233720368547758; " +
-                        "local expireDateScore = redis.call('zscore', KEYS[2], key); "
-                        + "if expireDateScore ~= false then "
-                            + "expireDate = tonumber(expireDateScore) "
-                        + "end; "
-                        + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], key); "
-                            + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                    + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
-                                            + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                                    "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                                                    "if mode == false or mode == 'LRU' then " +
-                                                        "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
-                                                    "else " +
-                                                        "redis.call('zincrby', KEYS[4], 1, key); " +
-                                                    "end; "
-                                            + "end; "
-                                        + "end; "
-                                        + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                                    + "end; "
-                                + "end; "
-                                + "if expireDate > tonumber(ARGV[1]) then "
-                                    + "table.insert(result, key); "
-                                    + "table.insert(result, val); "
-                                + "end; "
-                            + "end; "
-                        + "end;" +
-                        "return result;",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                System.currentTimeMillis());
+                + "if i % 2 == 0 then "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local key = s[i-1];" +
+                "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
+                "else " +
+                "redis.call('zincrby', KEYS[4], 1, key); " +
+                "end; "
+                + "end; "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "table.insert(result, key); "
+                + "table.insert(result, val); "
+                + "end; "
+                + "end; "
+                + "end;" +
+                "return result;",
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            System.currentTimeMillis());
     }
 
     @Override
@@ -2650,47 +2683,47 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         return readAll(RedisCommands.EVAL_MAP);
     }
 
-    
+
     @Override
     public RFuture<Collection<V>> readAllValuesAsync() {
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE_LIST,
-                "local s = redis.call('hgetall', KEYS[1]); "
-                    + "local result = {}; "
-                    + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); "
-                    + "for i, v in ipairs(s) do "
-                        + "if i % 2 == 0 then "
-                            + "local t, val = struct.unpack('dLc0', v); "
-                            + "local key = s[i-1];" +
-                            "local expireDate = 92233720368547758; " +
-                            "local expireDateScore = redis.call('zscore', KEYS[2], key); "
-                            + "if expireDateScore ~= false then "
-                                + "expireDate = tonumber(expireDateScore) "
-                            + "end; "
-                            + "if t ~= 0 then "
-                            + "local expireIdle = redis.call('zscore', KEYS[3], key); "
-                            + "if expireIdle ~= false then "
-                                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                                    + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
-                                    + "if maxSize ~= nil and maxSize ~= 0 then " +
-                                        "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                                        "if mode == false or mode == 'LRU' then " +
-                                            "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
-                                        "else " +
-                                            "redis.call('zincrby', KEYS[4], 1, key); " +
-                                        "end; "
-                                    + "end; "
-                                + "end; "
-                                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                            + "end; "
-                        + "end; "
-                        + "if expireDate > tonumber(ARGV[1]) then "
-                            + "table.insert(result, val); "
-                        + "end; "
-                        + "end; "
-                    + "end;" +
-                    "return result;",
-                Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
-                System.currentTimeMillis());
+            "local s = redis.call('hgetall', KEYS[1]); "
+                + "local result = {}; "
+                + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); "
+                + "for i, v in ipairs(s) do "
+                + "if i % 2 == 0 then "
+                + "local t, val = struct.unpack('dLc0', v); "
+                + "local key = s[i-1];" +
+                "local expireDate = 92233720368547758; " +
+                "local expireDateScore = redis.call('zscore', KEYS[2], key); "
+                + "if expireDateScore ~= false then "
+                + "expireDate = tonumber(expireDateScore) "
+                + "end; "
+                + "if t ~= 0 then "
+                + "local expireIdle = redis.call('zscore', KEYS[3], key); "
+                + "if expireIdle ~= false then "
+                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), key); "
+                + "if maxSize ~= nil and maxSize ~= 0 then " +
+                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                "if mode == false or mode == 'LRU' then " +
+                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), key); " +
+                "else " +
+                "redis.call('zincrby', KEYS[4], 1, key); " +
+                "end; "
+                + "end; "
+                + "end; "
+                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "end; "
+                + "end; "
+                + "if expireDate > tonumber(ARGV[1]) then "
+                + "table.insert(result, val); "
+                + "end; "
+                + "end; "
+                + "end;" +
+                "return result;",
+            Arrays.<Object>asList(getRawName(), getTimeoutSetName(), getIdleSetName(), getLastAccessTimeSetName(), getOptionsName()),
+            System.currentTimeMillis());
     }
 
     @Override
