@@ -48,10 +48,10 @@ public class LocalCachedMapOptions<K, V> extends MapOptions<K, V> {
         CLEAR,
         
         /**
-         * Store invalidated entry hash in invalidation log for 10 minutes.
-         * Cache keys for stored invalidated entry hashes will be removed
-         * if LocalCachedMap instance has been disconnected less than 10 minutes
-         * or whole local cache will be cleaned otherwise.
+          Store invalidated entry hash in invalidation log for 10 minutes.
+          Cache keys for stored invalidated entry hashes will be removed
+          if LocalCachedMap instance has been disconnected less than 10 minutes
+          or whole local cache will be cleaned otherwise.
          */
         LOAD
         

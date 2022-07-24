@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit;
  * @version 1.0, 2022/7/18 12:51
  * @since
  */
-class ReadWriteTest {
+class ReadWriteLockTest {
     private static final String LOCK_NAME = "test-rw-lock";
     private static final RedissonClient redisson = Redisson.create();
 

@@ -1,12 +1,12 @@
 /**
  * Copyright (c) 2013-2021 Nikita Koksharov
- *
+ * <p>
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -52,7 +52,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
     private static final RedisCommand<Set<Object>> ALL_VALUES = new RedisCommand<Set<Object>>("EVAL", new MapValueDecoder(new ObjectSetReplayDecoder<Object>()));
     private static final RedisCommand<Set<Entry<Object, Object>>> ALL_ENTRIES = new RedisCommand<>("EVAL", new ObjectMapEntryReplayDecoder());
     private static final RedisCommand<Map<Object, Object>> ALL_MAP = new RedisCommand<Map<Object, Object>>("EVAL", new ObjectMapReplayDecoder());
-    
+
     private long cacheUpdateLogTime = TimeUnit.MINUTES.toMillis(10);
     private byte[] instanceId;
     private ConcurrentMap<CacheKey, CacheValue> cache;
@@ -63,15 +63,15 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
 
     private LocalCacheListener listener;
     private LocalCacheView<K, V> localCacheView;
-    
-    public RedissonLocalCachedMap(CommandAsyncExecutor commandExecutor, String name, LocalCachedMapOptions<K, V> options, 
-            EvictionScheduler evictionScheduler, RedissonClient redisson, WriteBehindService writeBehindService) {
+
+    public RedissonLocalCachedMap(CommandAsyncExecutor commandExecutor, String name, LocalCachedMapOptions<K, V> options,
+                                  EvictionScheduler evictionScheduler, RedissonClient redisson, WriteBehindService writeBehindService) {
         super(commandExecutor, name, redisson, options, writeBehindService);
         init(options, redisson, evictionScheduler);
     }
 
-    public RedissonLocalCachedMap(Codec codec, CommandAsyncExecutor connectionManager, String name, LocalCachedMapOptions<K, V> options, 
-            EvictionScheduler evictionScheduler, RedissonClient redisson, WriteBehindService writeBehindService) {
+    public RedissonLocalCachedMap(Codec codec, CommandAsyncExecutor connectionManager, String name, LocalCachedMapOptions<K, V> options,
+                                  EvictionScheduler evictionScheduler, RedissonClient redisson, WriteBehindService writeBehindService) {
         super(codec, connectionManager, name, redisson, options, writeBehindService);
         init(options, redisson, evictionScheduler);
     }
@@ -83,6 +83,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
 
         localCacheView = new LocalCacheView<>(options, this);
         cache = localCacheView.getCache();
+        //
         listener = new LocalCacheListener(getRawName(), commandExecutor, this, codec, options, cacheUpdateLogTime) {
 
             @Override
@@ -120,7 +121,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (syncStrategy == SyncStrategy.UPDATE) {
                 ByteBuf mapValue = encodeMapValue(value);
                 msg = new LocalCachedMapUpdate(instanceId, mapKey, mapValue);
-            } else {
+            }
+            else {
                 msg = new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash());
             }
             listener.getInvalidationTopic().publishAsync(msg);
@@ -132,7 +134,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         if (listener.isDisabled(cacheKey)) {
             return null;
         }
-        
+
         return cache.put(cacheKey, new CacheValue(key, value));
     }
 
@@ -155,7 +157,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
                 if (cache.replace(cacheKey, v, new CacheValue(key, value))) {
                     return v;
                 }
-            } else {
+            }
+            else {
                 return null;
             }
         }
@@ -196,7 +199,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
     @Override
     public RFuture<Boolean> containsKeyAsync(Object key) {
         checkKey(key);
-        
+
         CacheKey cacheKey = localCacheView.toCacheKey(key);
         CacheValue cacheValue = cache.get(cacheKey);
         if (cacheValue == null) {
@@ -230,7 +233,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
     @Override
     public RFuture<Boolean> containsValueAsync(Object value) {
         checkValue(value);
-        
+
         CacheValue cacheValue = new CacheValue(null, value);
         if (!cache.containsValue(cacheValue)) {
             if (storeMode == LocalCachedMapOptions.StoreMode.LOCALCACHE) {
@@ -241,23 +244,25 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         }
         return new CompletableFutureWrapper<>(true);
     }
-    
+
     @Override
     public RFuture<V> getAsync(Object key) {
         checkKey(key);
 
         CacheKey cacheKey = localCacheView.toCacheKey(key);
+        //检查本地缓存能不能拿到
         CacheValue cacheValue = cache.get(cacheKey);
         if (cacheValue != null && (storeCacheMiss || cacheValue.getValue() != null)) {
             return new CompletableFutureWrapper<>((V) cacheValue.getValue());
         }
-
+        //数据不写入Redis
         if (storeMode == LocalCachedMapOptions.StoreMode.LOCALCACHE) {
             if (hasNoLoader()) {
                 return new CompletableFutureWrapper((Void) null);
             }
-
+            // 从loader读value
             CompletableFuture<V> future = loadValue((K) key, false);
+            // 写入缓存
             CompletableFuture<V> f = future.thenApply(value -> {
                 if (storeCacheMiss || value != null) {
                     cachePut(cacheKey, key, value);
@@ -266,23 +271,24 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             });
             return new CompletableFutureWrapper<>(f);
         }
-
+        // 调用RedissonMap的实现 从redis取数据
         RFuture<V> future = super.getAsync((K) key);
         CompletionStage<V> result = future.thenApply(value -> {
             if (storeCacheMiss || value != null) {
+                //写到缓存
                 cachePut(cacheKey, key, value);
             }
             return value;
         });
         return new CompletableFutureWrapper<>(result);
     }
-    
+
     protected static byte[] generateLogEntryId(byte[] keyHash) {
         byte[] result = new byte[keyHash.length + 1 + 8];
         result[16] = ':';
         byte[] id = new byte[8];
         ThreadLocalRandom.current().nextBytes(id);
-        
+
         System.arraycopy(keyHash, 0, result, 0, keyHash.length);
         System.arraycopy(id, 0, result, 17, id.length);
         return result;
@@ -308,18 +314,18 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         byte[] entryId = generateLogEntryId(cacheKey.getKeyHash());
         ByteBuf msg = createSyncMessage(mapKey, mapValue, cacheKey);
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE,
-                  "local v = redis.call('hget', KEYS[1], ARGV[1]); "
+            "local v = redis.call('hget', KEYS[1], ARGV[1]); "
                 + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]); "
                 + "if ARGV[4] == '1' then "
-                    + "redis.call('publish', KEYS[2], ARGV[3]); "
+                + "redis.call('publish', KEYS[2], ARGV[3]); "
                 + "end;"
                 + "if ARGV[4] == '2' then "
-                    + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
-                    + "redis.call('publish', KEYS[2], ARGV[3]); "
+                + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
+                + "redis.call('publish', KEYS[2], ARGV[3]); "
                 + "end;"
                 + "return v; ",
-                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                mapKey, mapValue, msg, invalidateEntryOnChange, System.currentTimeMillis(), entryId);
+            Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            mapKey, mapValue, msg, invalidateEntryOnChange, System.currentTimeMillis(), entryId);
     }
 
     protected ByteBuf createSyncMessage(ByteBuf mapKey, ByteBuf mapValue, CacheKey cacheKey) {
@@ -345,21 +351,21 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         ByteBuf msg = createSyncMessage(encodedKey, encodedValue, cacheKey);
 
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_BOOLEAN,
-                  "if ARGV[4] == '1' then "
-                    + "redis.call('publish', KEYS[2], ARGV[3]); "
+            "if ARGV[4] == '1' then "
+                + "redis.call('publish', KEYS[2], ARGV[3]); "
                 + "end;"
                 + "if ARGV[4] == '2' then "
-                    + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
-                    + "redis.call('publish', KEYS[2], ARGV[3]); "
+                + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
+                + "redis.call('publish', KEYS[2], ARGV[3]); "
                 + "end;"
                 + "if redis.call('hset', KEYS[1], ARGV[1], ARGV[2]) == 0 then "
-                  + "return 0; "
+                + "return 0; "
                 + "end; "
                 + "return 1; ",
-                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                encodedKey, encodedValue, msg, invalidateEntryOnChange, System.currentTimeMillis(), entryId);
+            Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            encodedKey, encodedValue, msg, invalidateEntryOnChange, System.currentTimeMillis(), entryId);
     }
-    
+
     @Override
     public void destroy() {
         cache.clear();
@@ -388,19 +394,19 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
 
         return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_MAP_VALUE,
-                "local v = redis.call('hget', KEYS[1], ARGV[1]); "
+            "local v = redis.call('hget', KEYS[1], ARGV[1]); "
                 + "if redis.call('hdel', KEYS[1], ARGV[1]) == 1 then "
-                    + "if ARGV[3] == '1' then "
-                        + "redis.call('publish', KEYS[2], ARGV[2]); "
-                    + "end; "
-                    + "if ARGV[3] == '2' then "
-                        + "redis.call('zadd', KEYS[3], ARGV[4], ARGV[5]);"
-                        + "redis.call('publish', KEYS[2], ARGV[2]); "
-                    + "end;"
+                + "if ARGV[3] == '1' then "
+                + "redis.call('publish', KEYS[2], ARGV[2]); "
+                + "end; "
+                + "if ARGV[3] == '2' then "
+                + "redis.call('zadd', KEYS[3], ARGV[4], ARGV[5]);"
+                + "redis.call('publish', KEYS[2], ARGV[2]); "
+                + "end;"
                 + "end; "
                 + "return v",
-                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                keyEncoded, msgEncoded, invalidateEntryOnChange, System.currentTimeMillis(), entryId);
+            Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            keyEncoded, msgEncoded, invalidateEntryOnChange, System.currentTimeMillis(), entryId);
     }
 
     @Override
@@ -409,84 +415,84 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             return new CompletableFutureWrapper<>(Collections.emptyList());
         }
 
-            if (invalidateEntryOnChange == 1) {
-                List<Object> params = new ArrayList<Object>(keys.length*2);
-                for (K k : keys) {
-                    ByteBuf keyEncoded = encodeMapKey(k);
-                    params.add(keyEncoded);
-                    
-                    CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
-                    cache.remove(cacheKey);
-                    ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
-                    params.add(msgEncoded);
-                }
-    
-                return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_LIST,
-                                "local result = {}; " + 
-                                "for j = 1, #ARGV, 2 do "
-                                + "local val = redis.call('hdel', KEYS[1], ARGV[j]);" 
-                                + "if val == 1 then "
-                                   + "redis.call('publish', KEYS[2], ARGV[j+1]); "
-                                + "end;"
-                                + "table.insert(result, val);"
-                              + "end;"
-                              + "return result;",
-                                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName()),
-                                params.toArray());            
+        if (invalidateEntryOnChange == 1) {
+            List<Object> params = new ArrayList<Object>(keys.length * 2);
+            for (K k : keys) {
+                ByteBuf keyEncoded = encodeMapKey(k);
+                params.add(keyEncoded);
+
+                CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
+                cache.remove(cacheKey);
+                ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
+                params.add(msgEncoded);
             }
-            
-            if (invalidateEntryOnChange == 2) {
-                List<Object> params = new ArrayList<Object>(keys.length*3);
-                params.add(System.currentTimeMillis());
-                for (K k : keys) {
-                    ByteBuf keyEncoded = encodeMapKey(k);
-                    params.add(keyEncoded);
-                    
-                    CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
-                    cache.remove(cacheKey);
-                    ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
-                    params.add(msgEncoded);
-                    
-                    byte[] entryId = generateLogEntryId(cacheKey.getKeyHash());
-                    params.add(entryId);
-                }
-                
-                return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_LIST,
-                                "local result = {}; " + 
-                                "for j = 2, #ARGV, 3 do "
-                                + "local val = redis.call('hdel', KEYS[1], ARGV[j]);" 
-                                + "if val == 1 then "
-                                    + "redis.call('zadd', KEYS[3], ARGV[1], ARGV[j+2]);"                                
-                                    + "redis.call('publish', KEYS[2], ARGV[j+1]); "
-                                + "end;"
-                                + "table.insert(result, val);"
-                              + "end;"
-                              + "return result;",
-                                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                                params.toArray());            
+
+            return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_LIST,
+                "local result = {}; " +
+                    "for j = 1, #ARGV, 2 do "
+                    + "local val = redis.call('hdel', KEYS[1], ARGV[j]);"
+                    + "if val == 1 then "
+                    + "redis.call('publish', KEYS[2], ARGV[j+1]); "
+                    + "end;"
+                    + "table.insert(result, val);"
+                    + "end;"
+                    + "return result;",
+                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName()),
+                params.toArray());
+        }
+
+        if (invalidateEntryOnChange == 2) {
+            List<Object> params = new ArrayList<Object>(keys.length * 3);
+            params.add(System.currentTimeMillis());
+            for (K k : keys) {
+                ByteBuf keyEncoded = encodeMapKey(k);
+                params.add(keyEncoded);
+
+                CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
+                cache.remove(cacheKey);
+                ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
+                params.add(msgEncoded);
+
+                byte[] entryId = generateLogEntryId(cacheKey.getKeyHash());
+                params.add(entryId);
             }
-    
+
+            return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_LIST,
+                "local result = {}; " +
+                    "for j = 2, #ARGV, 3 do "
+                    + "local val = redis.call('hdel', KEYS[1], ARGV[j]);"
+                    + "if val == 1 then "
+                    + "redis.call('zadd', KEYS[3], ARGV[1], ARGV[j+2]);"
+                    + "redis.call('publish', KEYS[2], ARGV[j+1]); "
+                    + "end;"
+                    + "table.insert(result, val);"
+                    + "end;"
+                    + "return result;",
+                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+                params.toArray());
+        }
+
         List<Object> params = new ArrayList<Object>(keys.length);
         for (K k : keys) {
             ByteBuf keyEncoded = encodeMapKey(k);
             params.add(keyEncoded);
-            
+
             CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
             cache.remove(cacheKey);
         }
-    
+
         RFuture<List<Long>> future = commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_LIST,
-                      "local result = {}; " + 
-                      "for i = 1, #ARGV, 1 do " 
-                      + "local val = redis.call('hdel', KEYS[1], ARGV[i]); "
-                      + "table.insert(result, val); "
-                    + "end;"
-                    + "return result;",
-                      Arrays.<Object>asList(getRawName()),
-                      params.toArray());
+            "local result = {}; " +
+                "for i = 1, #ARGV, 1 do "
+                + "local val = redis.call('hdel', KEYS[1], ARGV[i]); "
+                + "table.insert(result, val); "
+                + "end;"
+                + "return result;",
+            Arrays.<Object>asList(getRawName()),
+            params.toArray());
         return future;
     }
-    
+
     @Override
     protected RFuture<Long> fastRemoveOperationAsync(K... keys) {
         if (storeMode == LocalCachedMapOptions.StoreMode.LOCALCACHE) {
@@ -503,67 +509,67 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             return new CompletableFutureWrapper<>(count);
         }
 
-            if (invalidateEntryOnChange == 1) {
-                List<Object> params = new ArrayList<Object>(keys.length*2);
-                for (K k : keys) {
-                    ByteBuf keyEncoded = encodeMapKey(k);
-                    params.add(keyEncoded);
-                    
-                    CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
-                    cache.remove(cacheKey);
-                    ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
-                    params.add(msgEncoded);
-                }
+        if (invalidateEntryOnChange == 1) {
+            List<Object> params = new ArrayList<Object>(keys.length * 2);
+            for (K k : keys) {
+                ByteBuf keyEncoded = encodeMapKey(k);
+                params.add(keyEncoded);
 
-                return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LONG,
-                        "local counter = 0; " + 
-                                "for j = 1, #ARGV, 2 do " 
-                                + "if redis.call('hdel', KEYS[1], ARGV[j]) == 1 then "
-                                   + "redis.call('publish', KEYS[2], ARGV[j+1]); "
-                                   + "counter = counter + 1;"
-                                + "end;"
-                              + "end;"
-                              + "return counter;",
-                                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName()),
-                                params.toArray());            
+                CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
+                cache.remove(cacheKey);
+                ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
+                params.add(msgEncoded);
             }
-            
-            if (invalidateEntryOnChange == 2) {
-                List<Object> params = new ArrayList<Object>(keys.length*3);
-                params.add(System.currentTimeMillis());
-                for (K k : keys) {
-                    ByteBuf keyEncoded = encodeMapKey(k);
-                    params.add(keyEncoded);
-                    
-                    CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
-                    cache.remove(cacheKey);
-                    ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
-                    params.add(msgEncoded);
-                    
-                    byte[] entryId = generateLogEntryId(cacheKey.getKeyHash());
-                    params.add(entryId);
-                }
-                
-                return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LONG,
-                                "local counter = 0; " + 
-                                "for j = 2, #ARGV, 3 do " 
-                                + "if redis.call('hdel', KEYS[1], ARGV[j]) == 1 then "
-                                    + "redis.call('zadd', KEYS[3], ARGV[1], ARGV[j+2]);"                                
-                                    + "redis.call('publish', KEYS[2], ARGV[j+1]); "
-                                    + "counter = counter + 1;"
-                                + "end;"
-                              + "end;"
-                              + "return counter;",
-                                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                                params.toArray());            
+
+            return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LONG,
+                "local counter = 0; " +
+                    "for j = 1, #ARGV, 2 do "
+                    + "if redis.call('hdel', KEYS[1], ARGV[j]) == 1 then "
+                    + "redis.call('publish', KEYS[2], ARGV[j+1]); "
+                    + "counter = counter + 1;"
+                    + "end;"
+                    + "end;"
+                    + "return counter;",
+                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName()),
+                params.toArray());
+        }
+
+        if (invalidateEntryOnChange == 2) {
+            List<Object> params = new ArrayList<Object>(keys.length * 3);
+            params.add(System.currentTimeMillis());
+            for (K k : keys) {
+                ByteBuf keyEncoded = encodeMapKey(k);
+                params.add(keyEncoded);
+
+                CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
+                cache.remove(cacheKey);
+                ByteBuf msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, cacheKey.getKeyHash()));
+                params.add(msgEncoded);
+
+                byte[] entryId = generateLogEntryId(cacheKey.getKeyHash());
+                params.add(entryId);
             }
+
+            return commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_LONG,
+                "local counter = 0; " +
+                    "for j = 2, #ARGV, 3 do "
+                    + "if redis.call('hdel', KEYS[1], ARGV[j]) == 1 then "
+                    + "redis.call('zadd', KEYS[3], ARGV[1], ARGV[j+2]);"
+                    + "redis.call('publish', KEYS[2], ARGV[j+1]); "
+                    + "counter = counter + 1;"
+                    + "end;"
+                    + "end;"
+                    + "return counter;",
+                Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+                params.toArray());
+        }
 
         List<Object> params = new ArrayList<Object>(keys.length + 1);
         params.add(getRawName());
         for (K k : keys) {
             ByteBuf keyEncoded = encodeMapKey(k);
             params.add(keyEncoded);
-            
+
             CacheKey cacheKey = localCacheView.toCacheKey(keyEncoded);
             cache.remove(cacheKey);
         }
@@ -576,19 +582,19 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         List<Object> keys = Arrays.<Object>asList(getRawName(), listener.getUpdatesLogName());
         return super.sizeInMemoryAsync(keys);
     }
-    
+
     @Override
     public RFuture<Boolean> deleteAsync() {
         cache.clear();
         ByteBuf msgEncoded = encode(new LocalCachedMapClear(instanceId, listener.generateId(), false));
         return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if redis.call('del', KEYS[1], KEYS[3]) > 0 and ARGV[2] ~= '0' then "
+            "if redis.call('del', KEYS[1], KEYS[3]) > 0 and ARGV[2] ~= '0' then "
                 + "redis.call('publish', KEYS[2], ARGV[1]); "
-                + "return 1;" 
-              + "end; "
-              + "return 0;",
-              Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-              msgEncoded, invalidateEntryOnChange);
+                + "return 1;"
+                + "end; "
+                + "return 0;",
+            Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            msgEncoded, invalidateEntryOnChange);
     }
 
     @Override
@@ -600,7 +606,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         Map<K, V> result = new HashMap<K, V>();
         Set<K> mapKeys = new HashSet<K>(keys);
         Set<K> missedKeys = new HashSet<>();
-        for (Iterator<K> iterator = mapKeys.iterator(); iterator.hasNext();) {
+        for (Iterator<K> iterator = mapKeys.iterator(); iterator.hasNext(); ) {
             K key = iterator.next();
             CacheKey cacheKey = localCacheView.toCacheKey(key);
             CacheValue value = cache.get(cacheKey);
@@ -609,7 +615,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
                     result.put(key, (V) value.getValue());
                 }
                 iterator.remove();
-            } else {
+            }
+            else {
                 missedKeys.add(key);
             }
         }
@@ -621,7 +628,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
 
             if (!missedKeys.isEmpty()) {
                 CompletionStage<Map<K, V>> f = loadAllAsync(missedKeys, false, 1, result)
-                                                    .thenApply(r -> result);
+                    .thenApply(r -> result);
                 return new CompletableFutureWrapper<>(f);
             }
             return new CompletableFutureWrapper<>(result);
@@ -634,17 +641,17 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
 
             if (storeCacheMiss) {
                 missedKeys.stream()
-                        .filter(key -> !map.containsKey(key))
-                        .forEach(key -> {
-                            CacheKey cacheKey = localCacheView.toCacheKey(key);
-                            cachePut(cacheKey, key, null);
-                        });
+                    .filter(key -> !map.containsKey(key))
+                    .forEach(key -> {
+                        CacheKey cacheKey = localCacheView.toCacheKey(key);
+                        cachePut(cacheKey, key, null);
+                    });
             }
             return result;
         });
         return new CompletableFutureWrapper<>(f);
     }
-    
+
     private void cacheMap(Map<?, ?> map) {
         for (java.util.Map.Entry<?, ?> entry : map.entrySet()) {
             CacheKey cacheKey = localCacheView.toCacheKey(entry.getKey());
@@ -665,12 +672,12 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             return new CompletableFutureWrapper((Void) null);
         }
 
-        List<Object> params = new ArrayList<Object>(map.size()*3);
+        List<Object> params = new ArrayList<Object>(map.size() * 3);
         params.add(invalidateEntryOnChange);
-        params.add(map.size()*2);
+        params.add(map.size() * 2);
         byte[][] hashes = new byte[map.size()][];
         int i = 0;
-        
+
         for (java.util.Map.Entry<? extends K, ? extends V> t : map.entrySet()) {
             ByteBuf mapKey = encodeMapKey(t.getKey());
             ByteBuf mapValue = encodeMapValue(t.getValue());
@@ -686,15 +693,16 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             List<LocalCachedMapUpdate.Entry> entries = new ArrayList<LocalCachedMapUpdate.Entry>();
             for (int j = 2; j < params.size(); j += 2) {
                 ByteBuf key = (ByteBuf) params.get(j);
-                ByteBuf value = (ByteBuf) params.get(j+1);
+                ByteBuf value = (ByteBuf) params.get(j + 1);
                 entries.add(new LocalCachedMapUpdate.Entry(key, value));
-                
+
             }
             msgEncoded = encode(new LocalCachedMapUpdate(instanceId, entries));
-        } else if (syncStrategy == SyncStrategy.INVALIDATE) {
+        }
+        else if (syncStrategy == SyncStrategy.INVALIDATE) {
             msgEncoded = encode(new LocalCachedMapInvalidate(instanceId, hashes));
         }
-        
+
         if (invalidateEntryOnChange == 2) {
             long time = System.currentTimeMillis();
             for (byte[] hash : hashes) {
@@ -703,26 +711,26 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
                 params.add(entryId);
             }
         }
-        
+
         if (msgEncoded != null) {
             params.add(msgEncoded);
         }
 
         RFuture<Void> future = commandExecutor.evalWriteAsync(getRawName(), codec, RedisCommands.EVAL_VOID,
-                  "for i=3, tonumber(ARGV[2]) + 2, 5000 do "
-                    + "redis.call('hmset', KEYS[1], unpack(ARGV, i, math.min(i+4999, tonumber(ARGV[2]) + 2))); "
+            "for i=3, tonumber(ARGV[2]) + 2, 5000 do "
+                + "redis.call('hmset', KEYS[1], unpack(ARGV, i, math.min(i+4999, tonumber(ARGV[2]) + 2))); "
                 + "end; "
                 + "if ARGV[1] == '1' then "
-                    + "redis.call('publish', KEYS[2], ARGV[#ARGV]); "
+                + "redis.call('publish', KEYS[2], ARGV[#ARGV]); "
                 + "end;"
                 + "if ARGV[1] == '2' then "
-                    + "for i=tonumber(ARGV[2]) + 2 + 1, #ARGV - 1, 5000 do "
-                        + "redis.call('zadd', KEYS[3], unpack(ARGV, i, math.min(i+4999, #ARGV - 1))); "
-                    + "end; "
-                    + "redis.call('publish', KEYS[2], ARGV[#ARGV]); "
+                + "for i=tonumber(ARGV[2]) + 2 + 1, #ARGV - 1, 5000 do "
+                + "redis.call('zadd', KEYS[3], unpack(ARGV, i, math.min(i+4999, #ARGV - 1))); "
+                + "end; "
+                + "redis.call('publish', KEYS[2], ARGV[#ARGV]); "
                 + "end;",
-                Arrays.asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                params.toArray());
+            Arrays.asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            params.toArray());
 
         CompletionStage<Void> f = future.thenApply(res -> {
             cacheMap(map);
@@ -739,17 +747,17 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         byte[] entryId = generateLogEntryId(cacheKey.getKeyHash());
 
         RFuture<V> future = commandExecutor.evalWriteAsync(getRawName(), StringCodec.INSTANCE, new RedisCommand<Object>("EVAL", new NumberConvertor(value.getClass())),
-                "local result = redis.call('HINCRBYFLOAT', KEYS[1], ARGV[1], ARGV[2]); "
-              + "if ARGV[3] == '1' then "
-                   + "redis.call('publish', KEYS[2], ARGV[4]); "
-              + "end;"
-              + "if ARGV[3] == '2' then "
-                   + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
-                   + "redis.call('publish', KEYS[2], ARGV[4]); "
-              + "end;"
-              + "return result; ",
-              Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-              keyState, new BigDecimal(value.toString()).toPlainString(), invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
+            "local result = redis.call('HINCRBYFLOAT', KEYS[1], ARGV[1], ARGV[2]); "
+                + "if ARGV[3] == '1' then "
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+                + "if ARGV[3] == '2' then "
+                + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+                + "return result; ",
+            Arrays.<Object>asList(getRawName(), listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            keyState, new BigDecimal(value.toString()).toPlainString(), invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
 
         CompletionStage<V> f = future.thenApply(res -> {
             if (res != null) {
@@ -770,7 +778,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (prevValue == null) {
                 broadcastLocalCacheStore(value, mapKey, cacheKey);
                 return new CompletableFutureWrapper<>(true);
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper<>(false);
             }
@@ -796,7 +805,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (prevValue != null) {
                 broadcastLocalCacheStore(value, mapKey, cacheKey);
                 return new CompletableFutureWrapper<>(true);
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper<>(false);
             }
@@ -831,24 +841,24 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         }
 
         RFuture<Collection<V>> future = commandExecutor.evalReadAsync(getRawName(), codec, ALL_VALUES,
-                "local entries = redis.call('hgetall', KEYS[1]); "
-              + "local result = {};"
-              + "for j, v in ipairs(entries) do "
-                  + "if j % 2 ~= 0 then "
-                      + "local founded = false;"
-                      + "for i = 1, #ARGV, 1 do "
-                          + "if ARGV[i] == entries[j] then "
-                              + "founded = true;"
-                          + "end;"
-                      + "end; "
-                      + "if founded == false then "
-                          + "table.insert(result, entries[j+1]);"
-                      + "end;"
-                  + "end; "
-              + "end; "
-              + "return result; ",
-              Arrays.asList(getRawName()),
-              mapKeys.toArray());
+            "local entries = redis.call('hgetall', KEYS[1]); "
+                + "local result = {};"
+                + "for j, v in ipairs(entries) do "
+                + "if j % 2 ~= 0 then "
+                + "local founded = false;"
+                + "for i = 1, #ARGV, 1 do "
+                + "if ARGV[i] == entries[j] then "
+                + "founded = true;"
+                + "end;"
+                + "end; "
+                + "if founded == false then "
+                + "table.insert(result, entries[j+1]);"
+                + "end;"
+                + "end; "
+                + "end; "
+                + "return result; ",
+            Arrays.asList(getRawName()),
+            mapKeys.toArray());
 
         CompletionStage<Collection<V>> f = future.thenApply(res -> {
             result.addAll(res);
@@ -906,7 +916,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
     public void clearLocalCache() {
         get(clearLocalCacheAsync());
     }
-    
+
     @Override
     public RFuture<Void> clearLocalCacheAsync() {
         return listener.clearLocalCacheAsync();
@@ -943,25 +953,25 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
 
     private <R> RFuture<R> readAll(RedisCommand<?> evalCommandType, List<Object> mapKeys, R result) {
         return commandExecutor.evalReadAsync(getRawName(), codec, evalCommandType,
-                "local entries = redis.call('hgetall', KEYS[1]); "
-              + "local result = {};"
-              + "for j, v in ipairs(entries) do "
-              + "if j % 2 ~= 0 then "
-                      + "local founded = false;"
-                      + "for i = 1, #ARGV, 1 do "
-                          + "if ARGV[i] == entries[j] then "
-                              + "founded = true;"
-                          + "end;"
-                      + "end; "
-                      + "if founded == false then "
-                          + "table.insert(result, entries[j]);"
-                          + "table.insert(result, entries[j+1]);"
-                      + "end;"
-                  + "end; "
-               + "end; "
-              + "return result; ",
-              Arrays.<Object>asList(getRawName()),
-              mapKeys.toArray());
+            "local entries = redis.call('hgetall', KEYS[1]); "
+                + "local result = {};"
+                + "for j, v in ipairs(entries) do "
+                + "if j % 2 ~= 0 then "
+                + "local founded = false;"
+                + "for i = 1, #ARGV, 1 do "
+                + "if ARGV[i] == entries[j] then "
+                + "founded = true;"
+                + "end;"
+                + "end; "
+                + "if founded == false then "
+                + "table.insert(result, entries[j]);"
+                + "table.insert(result, entries[j+1]);"
+                + "end;"
+                + "end; "
+                + "end; "
+                + "return result; ",
+            Arrays.<Object>asList(getRawName()),
+            mapKeys.toArray());
     }
 
     @Override
@@ -973,7 +983,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (prevValue != null) {
                 broadcastLocalCacheStore(value, mapKey, cacheKey);
                 return new CompletableFutureWrapper<>(true);
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper<>(false);
             }
@@ -989,7 +1000,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         });
         return new CompletableFutureWrapper<>(f);
     }
-    
+
     @Override
     protected RFuture<Boolean> fastReplaceOperationAsync(K key, V value) {
         ByteBuf keyState = encodeMapKey(key);
@@ -999,25 +1010,25 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         ByteBuf msg = createSyncMessage(keyState, valueState, cacheKey);
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_BOOLEAN,
-                "if redis.call('hexists', KEYS[1], ARGV[1]) == 1 then "
-                    + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]); "
-                    
-                    + "if ARGV[3] == '1' then "
-                        + "redis.call('publish', KEYS[2], ARGV[4]); "
-                    + "end;"
-                    + "if ARGV[3] == '2' then "
-                        + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
-                        + "redis.call('publish', KEYS[2], ARGV[4]); "
-                    + "end;"
+            "if redis.call('hexists', KEYS[1], ARGV[1]) == 1 then "
+                + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]); "
 
-                    + "return 1; "
+                + "if ARGV[3] == '1' then "
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+                + "if ARGV[3] == '2' then "
+                + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+
+                + "return 1; "
                 + "else "
-                    + "return 0; "
+                + "return 0; "
                 + "end",
-                Arrays.<Object>asList(name, listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                keyState, valueState, invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
+            Arrays.<Object>asList(name, listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            keyState, valueState, invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
     }
-    
+
     @Override
     protected RFuture<V> replaceOperationAsync(K key, V value) {
         ByteBuf keyState = encodeMapKey(key);
@@ -1027,26 +1038,26 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         ByteBuf msg = createSyncMessage(keyState, valueState, cacheKey);
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-                "if redis.call('hexists', KEYS[1], ARGV[1]) == 1 then "
-                    + "local v = redis.call('hget', KEYS[1], ARGV[1]); "
-                    + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]); "
-                    
-                    + "if ARGV[3] == '1' then "
-                        + "redis.call('publish', KEYS[2], ARGV[4]); "
-                    + "end;"
-                    + "if ARGV[3] == '2' then "
-                        + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
-                        + "redis.call('publish', KEYS[2], ARGV[4]); "
-                    + "end;"
+            "if redis.call('hexists', KEYS[1], ARGV[1]) == 1 then "
+                + "local v = redis.call('hget', KEYS[1], ARGV[1]); "
+                + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]); "
 
-                    + "return v; "
+                + "if ARGV[3] == '1' then "
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+                + "if ARGV[3] == '2' then "
+                + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+
+                + "return v; "
                 + "else "
-                    + "return nil; "
+                + "return nil; "
                 + "end",
-                Arrays.<Object>asList(name, listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                keyState, valueState, invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
+            Arrays.<Object>asList(name, listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            keyState, valueState, invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
     }
-    
+
     @Override
     public RFuture<V> replaceAsync(K key, V value) {
         if (storeMode == LocalCachedMapOptions.StoreMode.LOCALCACHE) {
@@ -1056,7 +1067,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (prevValue != null) {
                 broadcastLocalCacheStore(value, mapKey, cacheKey);
                 return new CompletableFutureWrapper<>((V) prevValue.getValue());
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper((Void) null);
             }
@@ -1072,7 +1084,7 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         });
         return new CompletableFutureWrapper<>(f);
     }
-    
+
     @Override
     protected RFuture<Boolean> replaceOperationAsync(K key, V oldValue, V newValue) {
         ByteBuf keyState = encodeMapKey(key);
@@ -1083,21 +1095,21 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
         ByteBuf msg = createSyncMessage(keyState, newValueState, cacheKey);
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then "
-                    + "redis.call('hset', KEYS[1], ARGV[1], ARGV[3]); "
-                    + "if ARGV[4] == '1' then "
-                        + "redis.call('publish', KEYS[2], ARGV[5]); "
-                    + "end;"
-                    + "if ARGV[4] == '2' then "
-                        + "redis.call('zadd', KEYS[3], ARGV[6], ARGV[7]);"
-                        + "redis.call('publish', KEYS[2], ARGV[5]); "
-                    + "end;"
-                    + "return 1; "
+            "if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then "
+                + "redis.call('hset', KEYS[1], ARGV[1], ARGV[3]); "
+                + "if ARGV[4] == '1' then "
+                + "redis.call('publish', KEYS[2], ARGV[5]); "
+                + "end;"
+                + "if ARGV[4] == '2' then "
+                + "redis.call('zadd', KEYS[3], ARGV[6], ARGV[7]);"
+                + "redis.call('publish', KEYS[2], ARGV[5]); "
+                + "end;"
+                + "return 1; "
                 + "else "
-                    + "return 0; "
+                + "return 0; "
                 + "end",
-                Arrays.<Object>asList(name, listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
-                keyState, oldValueState, newValueState, invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
+            Arrays.<Object>asList(name, listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
+            keyState, oldValueState, newValueState, invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
     }
 
     @Override
@@ -1108,7 +1120,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (cacheReplace(cacheKey, key, oldValue, newValue)) {
                 broadcastLocalCacheStore(newValue, mapKey, cacheKey);
                 return new CompletableFutureWrapper<>(true);
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper<>(false);
             }
@@ -1135,22 +1148,22 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
 
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then "
-                    + "if ARGV[3] == '1' then "
-                        + "redis.call('publish', KEYS[2], ARGV[4]); "
-                    + "end;"
-                    + "if ARGV[3] == '2' then "
-                        + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
-                        + "redis.call('publish', KEYS[2], ARGV[4]); "
-                    + "end;"
-                    + "return redis.call('hdel', KEYS[1], ARGV[1]) "
+            "if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then "
+                + "if ARGV[3] == '1' then "
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+                + "if ARGV[3] == '2' then "
+                + "redis.call('zadd', KEYS[3], ARGV[5], ARGV[6]);"
+                + "redis.call('publish', KEYS[2], ARGV[4]); "
+                + "end;"
+                + "return redis.call('hdel', KEYS[1], ARGV[1]) "
                 + "else "
-                    + "return 0 "
+                + "return 0 "
                 + "end",
             Arrays.<Object>asList(name, listener.getInvalidationTopicName(), listener.getUpdatesLogName()),
             keyState, valueState, invalidateEntryOnChange, msg, System.currentTimeMillis(), entryId);
     }
-    
+
     @Override
     public RFuture<Boolean> removeAsync(Object key, Object value) {
         if (storeMode == LocalCachedMapOptions.StoreMode.LOCALCACHE) {
@@ -1159,7 +1172,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (cacheRemove(cacheKey, key, value)) {
                 broadcastLocalCacheStore((V) value, mapKey, cacheKey);
                 return new CompletableFutureWrapper<>(true);
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper<>(false);
             }
@@ -1185,7 +1199,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (prevValue != null) {
                 broadcastLocalCacheStore((V) value, mapKey, cacheKey);
                 return new CompletableFutureWrapper<>((V) prevValue.getValue());
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper((Void) null);
             }
@@ -1211,7 +1226,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
             if (prevValue == null) {
                 broadcastLocalCacheStore((V) value, mapKey, cacheKey);
                 return new CompletableFutureWrapper((Void) null);
-            } else {
+            }
+            else {
                 mapKey.release();
                 return new CompletableFutureWrapper<>((V) prevValue.getValue());
             }
@@ -1232,7 +1248,8 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
     public ByteBuf encode(Object value) {
         try {
             return LocalCachedMessageCodec.INSTANCE.getValueEncoder().encode(value);
-        } catch (IOException e) {
+        }
+        catch (IOException e) {
             throw new IllegalArgumentException(e);
         }
     }
@@ -1246,15 +1263,24 @@ public class RedissonLocalCachedMap<K, V> extends RedissonMap<K, V> implements R
     public Collection<V> cachedValues() {
         return localCacheView.cachedValues();
     }
-    
+
     @Override
     public Set<Entry<K, V>> cachedEntrySet() {
         return localCacheView.cachedEntrySet();
     }
-    
+
     @Override
     public Map<K, V> getCachedMap() {
         return localCacheView.getCachedMap();
     }
-    
+
+    /**
+     * 这是我自己方便debug加的方法
+     *
+     * @return ret
+     */
+    public CacheValue getCacheObject(K key) {
+        CacheKey cacheKey = localCacheView.toCacheKey(key);
+        return cache.get(cacheKey);
+    }
 }

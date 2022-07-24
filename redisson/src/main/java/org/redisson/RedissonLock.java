@@ -404,12 +404,12 @@ public class RedissonLock extends RedissonBaseLock {
                     //没持有锁了就删了key
                     "redis.call('del', KEYS[1]); " +
                     //发布解锁消息 让其他等锁的人过来竞争锁资源
+                    //解锁发布的消息到channel  publish 'channel' 0
                     "redis.call('publish', KEYS[2], ARGV[1]); " +
                     //解锁完无锁返回1
                     "return 1; " +
                 "end; " +
                 "return nil;",
-                //解锁发布的消息到channel  publish 'channel' 0
                 Arrays.asList(getRawName(), getChannelName()), LockPubSub.UNLOCK_MESSAGE, internalLockLeaseTime, getLockName(threadId));
     }
 

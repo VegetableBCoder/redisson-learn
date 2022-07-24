@@ -108,31 +108,32 @@ public class RedissonFairLock extends RedissonLock implements RLock {
         }
 
         long currentTime = System.currentTimeMillis();
-        //返回是否成功
+        //第一次尝试 返回是否成功
         if (command == RedisCommands.EVAL_NULL_BOOLEAN) {
             return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                     // remove stale threads
-                    "while true do " +
-                        "local firstThreadId2 = redis.call('lindex', KEYS[2], 0);" +
-                        // 如果排队的列表是空的 直接结束循环
+                 "while true do " +
+                        // 取排队的第一个线程
+                        "    local firstThreadId2 = redis.call('lindex', KEYS[2], 0);" +
+                        // 如果排队的列表是空的 跳出循环取锁
                         // 如果是空list 这条命令 eval "if false == redis.call('lindex','bb',0) then return 'a'; else return 'b'; end;" 0 返回的是a
-                        "if firstThreadId2 == false then " +
-                            "break;" +
-                        "end;" +
-                        // 从zset获取超时时间 判断是不是已经等锁超时了
-                        "local timeout = tonumber(redis.call('zscore', KEYS[3], firstThreadId2));" +
-                        //如果超时时间小于当前时间 则已经过期
-                        "if timeout <= tonumber(ARGV[3]) then " +
+                        "    if firstThreadId2 == false then " +
+                            "    break;" +
+                        "    end;" +
+                        // 从zset获取超时时间 判断第一个等待的人是不是已经等锁超时了
+                        "    local timeout = tonumber(redis.call('zscore', KEYS[3], firstThreadId2));" +
+                        // 如果超时时间小于当前时间 则已经过期
+                        "    if timeout <= tonumber(ARGV[3]) then " +
                             // remove the item from the queue and timeout set
                             // NOTE we do not alter any other timeout
-                            //超时了就从等待队列和超时记录集合中去除
-                            "redis.call('zrem', KEYS[3], firstThreadId2);" +
-                            "redis.call('lpop', KEYS[2]);" +
-                        "else " +
-                            "break;" +
-                        "end;" +
+                            // 超时了就把等待者从等待队列和超时记录集合中去除
+                            "    redis.call('zrem', KEYS[3], firstThreadId2);" +
+                            "    redis.call('lpop', KEYS[2]);" +
+                        "    else " +
+                            "    break;" +
+                        "    end;" +
                     "end;" +
-                    // 循环结束后 判断-锁不存在
+                    // 循环结束后 判断锁存不存在
                     "if (redis.call('exists', KEYS[1]) == 0) " +
                         //判断等待队列不存在
                         "and ((redis.call('exists', KEYS[2]) == 0) " +
@@ -142,11 +143,10 @@ public class RedissonFairLock extends RedissonLock implements RLock {
                         //去除等待队列的头 删除等待超时记录
                         "redis.call('lpop', KEYS[2]);" +
                         "redis.call('zrem', KEYS[3], ARGV[2]);" +
-
                         // decrease timeouts for all waiting in the queue
                         "local keys = redis.call('zrange', KEYS[3], 0, -1);" +
                         "for i = 1, #keys, 1 do " +
-                            //减超时时间
+                            //把所有人的等待超时时间都减少一个份wait-time(每个人都要排队所有第x就最多等wait-time* x)
                             "redis.call('zincrby', KEYS[3], -tonumber(ARGV[4]), keys[i]);" +
                         "end;" +
                         // 设置锁信息 重入次数
@@ -170,7 +170,7 @@ public class RedissonFairLock extends RedissonLock implements RLock {
                     Arrays.asList(getRawName(), threadsQueueName, timeoutSetName),
                     unit.toMillis(leaseTime), getLockName(threadId), currentTime, wait);
         }
-        //这个是在取锁失败的时候返回等待的大致ttl
+        //这个是在取锁失败的时候返回等待的大致等待的ttl
         if (command == RedisCommands.EVAL_LONG) {
             return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                     // remove stale threads
@@ -274,17 +274,20 @@ public class RedissonFairLock extends RedissonLock implements RLock {
                     + "break;"
                 + "end; "
               + "end;"
-                
+                //锁已经没了
               + "if (redis.call('exists', KEYS[1]) == 0) then " + 
                     "local nextThreadId = redis.call('lindex', KEYS[2], 0); " + 
                     "if nextThreadId ~= false then " +
+                        // 通知下一个等待者来获取锁
                         "redis.call('publish', KEYS[4] .. ':' .. nextThreadId, ARGV[1]); " +
                     "end; " +
                     "return 1; " +
                 "end;" +
+                // 不是自己持有锁 解锁失败
                 "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
                     "return nil;" +
                 "end; " +
+                // 重入次数-1
                 "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
                 "if (counter > 0) then " +
                     "redis.call('pexpire', KEYS[1], ARGV[2]); " +

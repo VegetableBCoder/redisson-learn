@@ -90,17 +90,22 @@ public abstract class LocalCacheListener {
     }
     
     public ConcurrentMap<CacheKey, CacheValue> createCache(LocalCachedMapOptions<?, ?> options) {
+        // 如果采用caffeine 淘汰策略就按照caffeine自己的方式实现(使用软引用,弱引用的依旧有效)
         if (options.getCacheProvider() == LocalCachedMapOptions.CacheProvider.CAFFEINE) {
             Caffeine<Object, Object> caffeineBuilder = Caffeine.newBuilder();
+            // 存活时长
             if (options.getTimeToLiveInMillis() > 0) {
                 caffeineBuilder.expireAfterWrite(options.getTimeToLiveInMillis(), TimeUnit.MILLISECONDS);
             }
+            // 空闲时长
             if (options.getMaxIdleInMillis() > 0) {
                 caffeineBuilder.expireAfterAccess(options.getMaxIdleInMillis(), TimeUnit.MILLISECONDS);
             }
+            // 最大容量
             if (options.getCacheSize() > 0) {
                 caffeineBuilder.maximumSize(options.getCacheSize());
             }
+            // 软引用,弱引用
             if (options.getEvictionPolicy() == LocalCachedMapOptions.EvictionPolicy.SOFT) {
                 caffeineBuilder.softValues();
             }
@@ -110,6 +115,7 @@ public abstract class LocalCacheListener {
             return caffeineBuilder.<CacheKey, CacheValue>build().asMap();
         }
 
+        //自定义实现的淘汰策略
         if (options.getEvictionPolicy() == EvictionPolicy.NONE) {
             return new NoneCacheMap<>(options.getTimeToLiveInMillis(), options.getMaxIdleInMillis());
         }

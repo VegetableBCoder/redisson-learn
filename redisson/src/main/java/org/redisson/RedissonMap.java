@@ -1134,11 +1134,11 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
         String name = getRawName(key);
         return commandExecutor.readAsync(name, codec, RedisCommands.HGET, name, encodeMapKey(key));
     }
-    
+    // localCachedMap 看子类的实现
     @Override
     public RFuture<V> getAsync(K key) {
         checkKey(key);
-
+        //直接hget的 mapCache也没有在读的过程中判断过期的情况
         RFuture<V> future = getOperationAsync(key);
         if (hasNoLoader()) {
             return future;
@@ -1148,7 +1148,7 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
         CompletionStage<V> f = future.thenCompose(res -> {
             // 没有取到
             if (res == null) {
-                // loader
+                // 走loader拿 并且是不覆盖redis数据的
                 return loadValue(key, false, threadId);
             }
             return CompletableFuture.completedFuture(res);
