@@ -711,7 +711,7 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
     }
 
     protected final <M> RFuture<M> mapWriterFuture(RFuture<M> future, MapWriterTask task) {
-        // 这个function直接就是true
+        // 这个传的function直接就是true
         return mapWriterFuture(future, task, r -> true);
     }
     
@@ -1146,7 +1146,9 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
 
         long threadId = Thread.currentThread().getId();
         CompletionStage<V> f = future.thenCompose(res -> {
+            // 没有取到
             if (res == null) {
+                // loader
                 return loadValue(key, false, threadId);
             }
             return CompletableFuture.completedFuture(res);
@@ -1649,12 +1651,14 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
     }
 
     protected CompletableFuture<V> loadValue(K key, boolean replaceValue, long threadId) {
+        // 这里进行了加锁操作 可以多线程load
         RLock lock = getLock(key);
         return lock.lockAsync(threadId).thenCompose(res -> {
+            // 如果是 loadAll且传的true
             if (replaceValue) {
                 return loadValue(key, lock, threadId);
             }
-            
+            // 如果是get的 走的是这里
             return getOperationAsync(key).thenCompose(r -> {
                 if (r != null) {
                     return lock.unlockAsync(threadId).thenApply(v -> r);
@@ -1674,6 +1678,7 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
         commandExecutor.getConnectionManager().getExecutor().execute(new Runnable() {
             @Override
             public void run() {
+                // 外部存储的如果取不到要就不管 如果取到了 将其写入redis 进去这里的replace都是true
                 V value;
                 try {
                     value = options.getLoader().load(key);
@@ -1702,7 +1707,6 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
                             });
                     return;
                 }
-                    
                 putOperationAsync(key, value)
                         .whenComplete((res, e) -> {
                     if (e != null) {

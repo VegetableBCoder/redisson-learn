@@ -555,13 +555,16 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<V> putOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
-            // key1: map名称 key2:超时集合 key3:idleset key4:create时发布的channel keys5: 更新时发布的channel key6: key7: 删除时发布的channel
-            //arg1 当前时间 arg2: hash-key arg3: value
+            // key1: map名称 key2:超时时间存储zset key3:idle zset key4:create时发布的channel keys5: 更新时发布的channel key6: key7: 删除时发布的channel
+            // arg1 当前时间 arg2: hash-key arg3: value
+            // 判断原来存不存在这个数据
             "local v = redis.call('hget', KEYS[1], ARGV[2]);" +
                 "local exists = false;" +
                 "if v ~= false then" +
+                // 对value进行解包 val是hset进去的值 暂时不知道t是干嘛的 但是可以从下文的pack 看出t是前导0(不为0的情况需要从 看)
                 "    local t, val = struct.unpack('dLc0', v);" +
                 "    local expireDate = 92233720368547758;" +
+                     // 获取过期的时间戳
                 "    local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]);" +
                 "    if expireDateScore ~= false then" +
                 "        expireDate = tonumber(expireDateScore)" +
@@ -1136,6 +1139,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
 
     @Override
     public RFuture<V> putAsync(K key, V value, long ttl, TimeUnit ttlUnit) {
+        // 默认没有idle淘汰机制
         return putAsync(key, value, ttl, ttlUnit, 0, null);
     }
 
@@ -1146,6 +1150,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
 
     @Override
     public RFuture<V> putAsync(K key, V value, long ttl, TimeUnit ttlUnit, long maxIdleTime, TimeUnit maxIdleUnit) {
+        // 检查not null
         checkKey(key);
         checkValue(value);
 
@@ -1156,6 +1161,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
             throw new IllegalArgumentException("maxIdleTime can't be negative");
         }
         if (ttl == 0 && maxIdleTime == 0) {
+            // 都0就不淘汰
             return putAsync(key, value);
         }
 
@@ -1166,7 +1172,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         if (maxIdleTime > 0 && maxIdleUnit == null) {
             throw new NullPointerException("maxIdleUnit param can't be null");
         }
-
+        // 转换成毫秒并根据当前时间戳 和传入的offset 计算出timeout,idle 啥时候算idle和timeout
         long ttlTimeout = 0;
         long ttlTimeoutDelta = 0;
         if (ttl > 0) {
@@ -1180,12 +1186,12 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
             maxIdleDelta = maxIdleUnit.toMillis(maxIdleTime);
             maxIdleTimeout = System.currentTimeMillis() + maxIdleDelta;
         }
-
+        // 这里是写入的操作
         RFuture<V> future = putOperationAsync(key, value, ttlTimeout, maxIdleTimeout, maxIdleDelta, ttlTimeoutDelta);
         if (hasNoWriter()) {
             return future;
         }
-
+        // 如果有自定义的writer
         MapWriterTask.Add listener = new MapWriterTask.Add(key, value);
         return mapWriterFuture(future, listener);
     }
@@ -1193,91 +1199,122 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<V> putOperationAsync(K key, V value, long ttlTimeout, long maxIdleTimeout,
                                            long maxIdleDelta, long ttlTimeoutDelta) {
         String name = getRawName(key);
+        // key1: map名称 key2:超时时间存储zset key3:idle zset key4:create时发布的channel
+        // keys5: 更新时发布的channel key6: 最近访问记录 key7: 删除时发布的channel key8:配置信息
+        // arg1 当前时间 arg2:超时时间, arg3:idle时间 arg4:多久算idle arg5: hash-key arg6: value
+        // 通过这些脚本可以看出来 client之间的时钟同步非常重要
         RFuture<V> future = commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
             "local insertable = false; "
+                // 旧的值 没有带fast的写操作是要返回旧值的
                 + "local v = redis.call('hget', KEYS[1], ARGV[5]); "
-                + "if v == false then "
-                + "insertable = true; "
+                + "    if v == false then "
+                // insert操作 如果运来有值就update
+                + "       insertable = true; "
                 + "else "
-                + "local t, val = struct.unpack('dLc0', v); "
-                + "local expireDate = 92233720368547758; "
-                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
-                + "if expireDateScore ~= false then "
-                + "expireDate = tonumber(expireDateScore) "
+                        // 解出val值
+                + "    local t, val = struct.unpack('dLc0', v); "
+                + "    local expireDate = 92233720368547758; "
+                        // 这里存储的timeout的时间戳
+                + "    local expireDateScore = redis.call('zscore', KEYS[2], ARGV[5]); "
+                + "    if expireDateScore ~= false then "
+                + "        expireDate = tonumber(expireDateScore) "
+                + "    end; "
+                       // t的意义暂时不明 但对比没有idle和timeout机制的是可以从pack看出来那边pack的前缀是0 这边传入的参数: 多久没使用算idle(delta值)
+                + "    if t ~= 0 then "
+                           // 从zset取记录的时间戳
+                + "        local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
+                            // 取idle的时间戳
+                + "        if expireIdle ~= false then "
+                + "            expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "        end; "
+                + "    end; "
+                       // 和当前时间比较 判断key是不是已经过期了
+                + "    if expireDate <= tonumber(ARGV[1]) then "
+                          // 如果原来的过期了 也算是新insert的
+                + "        insertable = true; "
+                + "    end; "
                 + "end; "
-                + "if t ~= 0 then "
-                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
-                + "if expireIdle ~= false then "
-                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                + "end; "
-                + "end; "
-                + "if expireDate <= tonumber(ARGV[1]) then "
-                + "insertable = true; "
-                + "end; "
-                + "end; "
-
+                    // 记录超时时间
                 + "if tonumber(ARGV[2]) > 0 then "
-                + "redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
+                + "    redis.call('zadd', KEYS[2], ARGV[2], ARGV[5]); "
                 + "else "
-                + "redis.call('zrem', KEYS[2], ARGV[5]); "
+                        // 没有超时设置 如果上一次put的时候有的话就需要被remove
+                + "    redis.call('zrem', KEYS[2], ARGV[5]); "
                 + "end; "
+                    // 同样的 idle的设置
                 + "if tonumber(ARGV[3]) > 0 then "
-                + "redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
+                + "    redis.call('zadd', KEYS[3], ARGV[3], ARGV[5]); "
                 + "else "
-                + "redis.call('zrem', KEYS[3], ARGV[5]); "
+                + "    redis.call('zrem', KEYS[3], ARGV[5]); "
                 + "end; "
-
+                    // 既然有 idle的情况 以及淘汰机制(LRU/LFU) 就需要记录使用次数 和使用的时间戳
                 // last access time
+                    // 从配置读取最大容量
                 + "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
+                    // 不限制 那就直接写 限制的话可能就要做淘汰了
                 "if maxSize ~= nil and maxSize ~= 0 then " +
                 "    local currentTime = tonumber(ARGV[1]); " +
                 "    local lastAccessTimeSetName = KEYS[6]; " +
-
-                "        local mode = redis.call('hget', KEYS[8], 'mode'); " +
-                "        if mode == false or mode == 'LRU' then " +
-                "            redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
-                "        end; " +
-
+                        // 淘汰算法 LRU/LFU?
+                "    local mode = redis.call('hget', KEYS[8], 'mode'); " +
+                "    if mode == false or mode == 'LRU' then " +
+                        // 先把自己的访问时间加进去
+                "        redis.call('zadd', lastAccessTimeSetName, currentTime, ARGV[5]); " +
+                "    end; " +
+                    // map的元素个数 是否已经达到最大容量
                 "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
+                //   insert的时候只要LRU
                 "    if cacheSize >= maxSize then " +
+                         // 淘汰掉多出来的元素(这里自己已经加入进去了)
                 "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
                 "        for index, lruItem in ipairs(lruItems) do " +
+                             // 如果不是自己这个key就淘汰 如果是自己的不管
                 "            if lruItem and lruItem ~= ARGV[5] then " +
+                                 // 取出来 需要publish出去给监听器使用
                 "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +
+                                 // 删掉 hkey ,timeout记录,idle记录 最近访问记录
                 "                redis.call('hdel', KEYS[1], lruItem); " +
                 "                redis.call('zrem', KEYS[2], lruItem); " +
                 "                redis.call('zrem', KEYS[3], lruItem); " +
                 "                redis.call('zrem', lastAccessTimeSetName, lruItem); " +
-                " if lruItemValue ~= false then " +
-                "                local removedChannelName = KEYS[7]; " +
-                "local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
-                "                local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
-                "                redis.call('publish', removedChannelName, msg); " +
-                "end; " +
+                                // 如果拿到了
+                "                if lruItemValue ~= false then " +
+                                // 通过publish和subscribe发送出去
+                "                    local removedChannelName = KEYS[7]; " +
+                                     // idle时间和值
+                "                    local ttl, obj = struct.unpack('dLc0', lruItemValue);" +
+                                     // 打包 key和value
+                "                    local msg = struct.pack('Lc0Lc0', string.len(lruItem), lruItem, string.len(obj), obj);" +
+                                     // publish
+                "                    redis.call('publish', removedChannelName, msg); " +
+                "                end; " +
                 "            end; " +
                 "        end; " +
                 "    end; " +
+                "    if mode == 'LFU' then " +
+                         // 先把自己的使用次数+1
+                "        redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
+                "    end; " +
 
-                "if mode == 'LFU' then " +
-                "redis.call('zincrby', lastAccessTimeSetName, 1, ARGV[5]); " +
-                "end; " +
-
-                "end; "
-
+                " end; "
+                    //  把idle的delta 和value 打包
                 + "local value = struct.pack('dLc0', ARGV[4], string.len(ARGV[6]), ARGV[6]); "
+                // 然后hset进去
                 + "redis.call('hset', KEYS[1], ARGV[5], value); "
-
+                // 是加进去的 还是覆盖的旧的
                 + "if insertable == true then "
-                + "local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
-                + "redis.call('publish', KEYS[4], msg); "
-                + "return nil;"
+                // 打包消息发送
+                + "    local msg = struct.pack('Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6]); "
+                + "    redis.call('publish', KEYS[4], msg); "
+                        // insert 返回的null
+                + "    return nil;"
                 + "end; "
-
+                // 发到覆盖的channel
                 + "local t, val = struct.unpack('dLc0', v); "
 
                 + "local msg = struct.pack('Lc0Lc0Lc0', string.len(ARGV[5]), ARGV[5], string.len(ARGV[6]), ARGV[6], string.len(val), val); "
                 + "redis.call('publish', KEYS[5], msg); "
-
+                // 返回的旧值
                 + "return val",
             Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getCreatedChannelName(name),
                 getUpdatedChannelName(name), getLastAccessTimeSetName(name), getRemovedChannelName(name), getOptionsName(name)),
