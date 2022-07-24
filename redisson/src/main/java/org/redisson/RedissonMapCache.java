@@ -145,7 +145,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         if (maxSize < 0) {
             throw new IllegalArgumentException("maxSize should be greater than zero");
         }
-
+        // 把配置写到redis
         List<Object> params = new ArrayList<>(3);
         params.add(getOptionsName());
         params.add("max-size");
@@ -555,6 +555,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
     protected RFuture<V> putOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
+            // key1: map名称 key2:超时集合 key3:idleset key4:create时发布的channel keys5: 更新时发布的channel key6: key7: 删除时发布的channel
             "local v = redis.call('hget', KEYS[1], ARGV[2]);" +
                 "local exists = false;" +
                 "if v ~= false then" +

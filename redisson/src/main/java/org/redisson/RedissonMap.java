@@ -711,13 +711,16 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
     }
 
     protected final <M> RFuture<M> mapWriterFuture(RFuture<M> future, MapWriterTask task) {
+        // 这个function直接就是true
         return mapWriterFuture(future, task, r -> true);
     }
     
     protected final <M> RFuture<M> mapWriterFuture(RFuture<M> future, MapWriterTask task, Function<M, Boolean> condition) {
+        // 异步写入的情况
         if (options != null && options.getWriteMode() == WriteMode.WRITE_BEHIND) {
             CompletionStage<M> f = future.whenComplete((res, e) -> {
                 if (e == null && condition.apply(res)) {
+                    //加到任务 定时一次poll一批进行写操作
                     writeBehindTask.addTask(task);
                 }
             });
@@ -729,6 +732,7 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
                 CompletableFuture<M> promise = new CompletableFuture<>();
                 commandExecutor.getConnectionManager().getExecutor().execute(() -> {
                     try {
+                        //用自定义的writer进行操作
                         if (task instanceof MapWriterTask.Add) {
                             options.getWriter().write(task.getMap());
                         } else {
@@ -1281,10 +1285,12 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
     
     @Override
     public RFuture<V> putAsync(K key, V value) {
+        //key !=null && value !=null
         checkKey(key);
         checkValue(value);
         
         RFuture<V> future = putOperationAsync(key, value);
+        //没有writer 没有自己定义writer走这里return
         if (hasNoWriter()) {
             return future;
         }
@@ -1292,11 +1298,15 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
         return mapWriterFuture(future, new MapWriterTask.Add(key, value));
     }
 
+    // 这里是父类的,LocalCachedMap和MapCache都有自己的实现方式
     protected RFuture<V> putOperationAsync(K key, V value) {
         String name = getRawName(key);
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
+                //hget一下 取得原来的值
                 "local v = redis.call('hget', KEYS[1], ARGV[1]); "
+                // hset 把新的set进去
                 + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]); "
+                // 返回旧的
                 + "return v",
                 Collections.singletonList(name), encodeMapKey(key), encodeMapValue(value));
     }

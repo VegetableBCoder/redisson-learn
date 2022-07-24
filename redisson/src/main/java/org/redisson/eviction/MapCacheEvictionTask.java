@@ -63,12 +63,12 @@ public class MapCacheEvictionTask extends EvictionTask {
         // lua的for 初始值 max,每次的增量
         return
             //keys[6]=redisson__execute_task_once_latch:{key}  redisson_map_cache_expired:{key}
-            // 使用setnx 是为了防止多个线程同时去对一个map进行过期回收
+            // 使用setnx加锁 是为了防止一个周期内多次清理
             executor.evalWriteNoRetryAsync(name, LongCodec.INSTANCE, RedisCommands.EVAL_INTEGER,
                 "if redis.call('setnx', KEYS[6], ARGV[4]) == 0 then "
                  + "return -1;"
               + "end;"
-            // 为这个清理的任务设置一个过期时间 latchExpireTime (这个跟最近清理的结果有关)
+            // 为这个清理的任务的锁设置一个过期时间 让他自己过期就好 latchExpireTime (这个跟最近清理的结果有关)
               + "redis.call('expire', KEYS[6], ARGV[3]); "
             // 从超时的 timeout set 按时间戳(score) 查询过期keys(对多keysLimit个) 并为它声明一个局部变量 expiredKeys1
             // zrangebyscore redisson__timeout__set:{key-name} 0 当前时间戳 limit 0 keysLimit
