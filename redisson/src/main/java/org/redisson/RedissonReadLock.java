@@ -118,7 +118,7 @@ public class RedissonReadLock extends RedissonLock implements RLock {
                 // 自己没有持有了 删掉
                     "redis.call('hdel', KEYS[1], ARGV[2]); " +
                 "end;" +
-                // 记录过期时间的key
+                // 删除记录过期时间的key
                 "redis.call('del', KEYS[3] .. ':' .. (counter+1)); " +
                 // 除了mode还有别的key
                 "if (redis.call('hlen', KEYS[1]) > 1) then " +

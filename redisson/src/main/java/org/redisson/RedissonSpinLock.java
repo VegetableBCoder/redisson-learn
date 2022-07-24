@@ -93,6 +93,7 @@ public class RedissonSpinLock extends RedissonBaseLock {
         // LockOptions.defaults() -> ExponentialBackOff
         LockOptions.BackOffPolicy backOffPolicy = backOff.create();
         while (ttl != null) {
+            // NOTE: 轮询时间变化的在这里
             //等待一段时间 再尝试获取锁 等待的时间会逐渐递增
             /**  @see LockOptions.ExponentialBackOffPolicy#getNextSleepPeriod() (default)*/
             long nextSleepPeriod = backOffPolicy.getNextSleepPeriod();

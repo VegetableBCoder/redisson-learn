@@ -264,7 +264,16 @@ client2.shutdown();
 
 ### 可重入锁
 
-> 取锁脚本流程 补充流程图 
+* 使用锁获取尝试和等待的机制
+![锁等待和获取](./lock/RedissonLock.dio.svg)
+
+* 取锁脚本的逻辑
+
+![取锁脚本](./lock/Redisson-Lock-Script.dio.svg)
+
+* 解锁过程
+
+![解锁过程](./lock/UnLock.dio.svg)
 
 ### 公平锁
 
@@ -272,13 +281,36 @@ client2.shutdown();
 
 * 取锁流程
 
+![取锁流程](./fair-lock/FairLock.dio.svg)
+
+* 解锁流程
+
+![解锁流程](./fair-lock//UnLock.dio.svg)
+
 待补充
 
 ### 读写锁
 
-> 读写锁允许多个线程持有读锁,但只允许一个线程持有写锁,当然一个线程同时持有读锁写锁也是可以的
+> 读写锁允许多个线程持有读锁,但只允许一个线程持有写锁,当然一个线程同时持有读锁写锁也是可以的;
 
-* 取锁流程待补充
+> 读锁的强制解锁方法会将所有持有者的锁全部删除并发布解锁消息
+
+
+* 读锁获取流程
+
+![获取读锁](./ReadLock/ReadLock.dio.svg)
+
+* 读锁解锁
+
+![读锁解锁](./ReadLock/UnLock.dio.svg)
+
+* 写锁获取
+
+![写锁获取](./WriteLock/WriteLock.dio.svg)
+
+* 写锁释放
+
+![写锁释放](./WriteLock/Unlock.dio.svg)
 
 ### 自旋锁
 
