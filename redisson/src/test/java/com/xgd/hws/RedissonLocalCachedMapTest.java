@@ -6,11 +6,9 @@ import org.junit.jupiter.api.Test;
 import org.redisson.Redisson;
 import org.redisson.RedissonLocalCachedMap;
 import org.redisson.api.LocalCachedMapOptions;
-import org.redisson.api.RLocalCachedMap;
 import org.redisson.api.RedissonClient;
 import org.redisson.cache.CacheValue;
 import org.redisson.client.codec.LongCodec;
-import org.redisson.codec.JacksonCodec;
 import org.redisson.codec.JsonJacksonCodec;
 
 import java.util.Objects;
@@ -41,9 +39,9 @@ class RedissonLocalCachedMapTest {
 
     @Test
     void redissonCachedMap() {
-        //构造方法是protected的 使用defaults来创建
+        // 构造方法是protected的 使用defaults来创建
         LocalCachedMapOptions<String, Long> options = LocalCachedMapOptions.<String, Long>defaults()
-            //本地缓存存活时长
+            // 本地缓存存活时长
             .timeToLive(100, TimeUnit.SECONDS)
             // 最大空闲时长
             .maxIdle(50, TimeUnit.SECONDS)
@@ -67,7 +65,7 @@ class RedissonLocalCachedMapTest {
             .syncStrategy(LocalCachedMapOptions.SyncStrategy.INVALIDATE);
         RedissonLocalCachedMap<String, Long> localCachedMap = (RedissonLocalCachedMap<String, Long>) redisson
             .getLocalCachedMap("test-local", LongCodec.INSTANCE, options);
-        //使用>127的数据 防止常量池导致判断对象是不是同一个出错
+        // 使用>127的数据 防止常量池导致判断对象是不是同一个出错
         localCachedMap.put("test", Long.MAX_VALUE);
         localCachedMap.get("test");
         // 看看相同的设置能不能使用同一个本地缓存
@@ -78,7 +76,7 @@ class RedissonLocalCachedMapTest {
         // 在这里debug 判断cache中缓存的是不是同一个对象 这个方法是自己加的
         CacheValue cachedValue1 = localCachedMap.getCacheObject("test");
         CacheValue cachedValue2 = localCachedMap2.getCacheObject("test");
-        //注意 这两个Long 仅仅是值相同 不是同一个对象 说明多个RedissonLocalCachedMap没法共用相同的本地缓存 甚至仅仅共享相同的对象
+        // 注意 这两个Long 仅仅是值相同 不是同一个对象 说明多个RedissonLocalCachedMap没法共用相同的本地缓存 甚至仅仅共享相同的对象
         assertEquals(cachedValue1.getValue(), cachedValue2.getValue());
         assertFalse(cachedValue1.getValue() == cachedValue2.getValue());
         localCachedMap.destroy();

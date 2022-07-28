@@ -561,7 +561,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
             "local v = redis.call('hget', KEYS[1], ARGV[2]);" +
                 "local exists = false;" +
                 "if v ~= false then" +
-                // 对value进行解包 val是hset进去的值 暂时不知道t是干嘛的 但是可以从下文的pack 看出t是前导0(不为0的情况需要从 看)
+                // 对value进行解包 val是hset进去的值 这里t实际上是idle设置
                 "    local t, val = struct.unpack('dLc0', v);" +
                 "    local expireDate = 92233720368547758;" +
                      // 获取过期的时间戳
@@ -569,20 +569,23 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "    if expireDateScore ~= false then" +
                 "        expireDate = tonumber(expireDateScore)" +
                 "    end;" +
+                // 有idle设置
                 "    if t ~= 0 then" +
+                // idle时间戳
                 "        local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]);" +
                 "        if expireIdle ~= false then" +
                 "            expireDate = math.min(expireDate, tonumber(expireIdle))" +
                 "        end;" +
                 "    end;" +
+                // 有没有过期
                 "    if expireDate > tonumber(ARGV[1]) then" +
                 "        exists = true;" +
                 "    end;" +
                 "end;" +
-
+                // 删除超时时间 idle时间
                 "redis.call('zrem', KEYS[2], ARGV[2]); " +
                 "redis.call('zrem', KEYS[3], ARGV[2]); " +
-
+                // 打包 这里没有idle设置
                 "local value = struct.pack('dLc0', 0, string.len(ARGV[3]), ARGV[3]);" +
                 "redis.call('hset', KEYS[1], ARGV[2], value);" +
                 "local currentTime = tonumber(ARGV[1]);" +
@@ -1186,7 +1189,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
             maxIdleDelta = maxIdleUnit.toMillis(maxIdleTime);
             maxIdleTimeout = System.currentTimeMillis() + maxIdleDelta;
         }
-        // 这里是写入的操作
+        // NOTE 这里是写入的操作
         RFuture<V> future = putOperationAsync(key, value, ttlTimeout, maxIdleTimeout, maxIdleDelta, ttlTimeoutDelta);
         if (hasNoWriter()) {
             return future;
@@ -1219,7 +1222,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 + "    if expireDateScore ~= false then "
                 + "        expireDate = tonumber(expireDateScore) "
                 + "    end; "
-                       // t的意义暂时不明 但对比没有idle和timeout机制的是可以从pack看出来那边pack的前缀是0 这边传入的参数: 多久没使用算idle(delta值)
+                       //  但对比没有idle和timeout机制的是可以从pack看出来那边pack的前缀是0 这边pack传入的参数: 多久没使用算idle(delta值)
                 + "    if t ~= 0 then "
                            // 从zset取记录的时间戳
                 + "        local expireIdle = redis.call('zscore', KEYS[3], ARGV[5]); "
@@ -1247,7 +1250,7 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 + "else "
                 + "    redis.call('zrem', KEYS[3], ARGV[5]); "
                 + "end; "
-                    // 既然有 idle的情况 以及淘汰机制(LRU/LFU) 就需要记录使用次数 和使用的时间戳
+                    // 记录使用次数 和使用的时间戳
                 // last access time
                     // 从配置读取最大容量
                 + "local maxSize = tonumber(redis.call('hget', KEYS[8], 'max-size')); " +
@@ -1263,12 +1266,11 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
                 "    end; " +
                     // map的元素个数 是否已经达到最大容量
                 "    local cacheSize = tonumber(redis.call('hlen', KEYS[1])); " +
-                //   insert的时候只要LRU
                 "    if cacheSize >= maxSize then " +
                          // 淘汰掉多出来的元素(这里自己已经加入进去了)
                 "        local lruItems = redis.call('zrange', lastAccessTimeSetName, 0, cacheSize - maxSize); " +
                 "        for index, lruItem in ipairs(lruItems) do " +
-                             // 如果不是自己这个key就淘汰 如果是自己的不管
+                             // 如果不是自己这个key就淘汰 如果是自己的不管 (LFU会出现这个)
                 "            if lruItem and lruItem ~= ARGV[5] then " +
                                  // 取出来 需要publish出去给监听器使用
                 "                local lruItemValue = redis.call('hget', KEYS[1], lruItem); " +

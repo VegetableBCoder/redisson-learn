@@ -49,7 +49,7 @@ public class RedissonMapCacheTest {
      * @throws InterruptedException
      */
     @Test
-    void mapCacheSample() throws InterruptedException {
+    void debug() throws InterruptedException {
         MapOptions<Object, Object> options = MapOptions.defaults();
         LocalCachedMapOptions.defaults();
         RedissonMapCache<String, String> map = (RedissonMapCache) redisson.getMapCache("test-key1", StringCodec.INSTANCE,
@@ -61,9 +61,9 @@ public class RedissonMapCacheTest {
             LocalCachedMapOptions.defaults());
         // 可以指定timeout 30s过期,idle time, 10s也淘汰掉
         // put入口看这个
-        map2.put("test-hkey2", "test-value2", 30, TimeUnit.SECONDS, 10, TimeUnit.SECONDS);
         // 可以指定淘汰算法 默认LRU,LRU,LFU
         map2.setMaxSize(1000, EvictionMode.LFU);
+        map2.put("test-hkey2", "test-value2", 30, TimeUnit.SECONDS, 10, TimeUnit.SECONDS);
         // get入口看这个(和redissonMap一样的)
         map2.get("test-hkey2");
         Thread.sleep(10 * 1000);

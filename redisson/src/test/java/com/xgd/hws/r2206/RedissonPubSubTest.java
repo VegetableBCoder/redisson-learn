@@ -1,4 +1,4 @@
-package com.xgd.hws;
+package com.xgd.hws.r2206;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;

@@ -96,7 +96,7 @@ abstract class EvictionTask implements Runnable {
 //                            && sizeHistory.peekLast() < size) {
 //                        prevDelay = Math.max(minDelay, prevDelay/2);
 //                    }
-
+                // 会按照一定的延迟计算下一次清理的间隔
                 if (sizeHistory.peekFirst().intValue() == sizeHistory.peekLast()
                         && sizeHistory.peekLast().intValue() == size) {
                     if (size >= keysLimit) {
@@ -109,7 +109,7 @@ abstract class EvictionTask implements Runnable {
 
                 sizeHistory.pollFirst();
             }
-
+            //
             sizeHistory.add(size);
             schedule();
         });

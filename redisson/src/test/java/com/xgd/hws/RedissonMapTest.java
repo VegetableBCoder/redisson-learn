@@ -2,31 +2,15 @@ package com.xgd.hws;
 
 import org.junit.jupiter.api.Test;
 import org.redisson.Redisson;
-import org.redisson.RedissonMapCache;
-import org.redisson.api.EvictionMode;
-import org.redisson.api.LocalCachedMapOptions;
 import org.redisson.api.MapOptions;
 import org.redisson.api.RMap;
-import org.redisson.api.RMapCache;
-import org.redisson.api.RedissonClient;
 import org.redisson.api.map.MapLoader;
 import org.redisson.api.map.MapWriter;
-import org.redisson.api.map.event.EntryCreatedListener;
-import org.redisson.api.map.event.EntryEvent;
-import org.redisson.api.map.event.EntryExpiredListener;
-import org.redisson.api.map.event.EntryRemovedListener;
-import org.redisson.api.map.event.EntryUpdatedListener;
-import org.redisson.api.map.event.MapEntryListener;
 import org.redisson.client.codec.StringCodec;
-import org.redisson.eviction.EvictionScheduler;
-import org.redisson.eviction.MapCacheEvictionTask;
 
-import java.lang.reflect.Field;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -40,6 +24,14 @@ class RedissonMapTest {
 
     private static final Redisson redisson = (Redisson) Redisson.create();
 
+    @Test
+    void debug() {
+        RMap<String, String> map = redisson.getMap("debug-map", StringCodec.INSTANCE);
+        map.put("key1", "value1");
+        String value1 = map.get("key1");
+        assertEquals("value1", value1);
+    }
+
     /**
      * 同步的情况下的writer loader
      * 同步模式是先写外部存储 再写redis
@@ -47,7 +39,7 @@ class RedissonMapTest {
      * 如果用来持久化的话 还需要再处理listener
      */
     @Test
-    void writerLoaderSampleSync() {
+    void writerLoaderAndListenerSample() {
         Map<String, Object> outStorage = new HashMap<>();
         MapOptions<String, Object> options = MapOptions.<String, Object>defaults()
             .writeMode(MapOptions.WriteMode.WRITE_THROUGH)
@@ -68,7 +60,7 @@ class RedissonMapTest {
 
                 @Override
                 public void write(Map<String, Object> map) {
-                    // 这里可以用外部存储装一下 但是还得通过pubsub接受其他节点发布的
+                    // 这里可以用外部存储装一下
                     outStorage.putAll(map);
                 }
 
@@ -77,7 +69,7 @@ class RedissonMapTest {
                     outStorage.keySet().removeAll(keys);
                 }
             });
-        RMap<String, Object> map = redisson.getMapCache("test-cache", StringCodec.INSTANCE, options);
+        RMap<String, Object> map = redisson.getMap("test-map", StringCodec.INSTANCE, options);
         map.put("test", "value");
         map.put("test2", "value2");
         map.put("test3", "value3");
@@ -99,7 +91,7 @@ class RedissonMapTest {
         // 这里说明loadAll的过程中将test4加入到了缓存
         outStorage.remove("test4");
         assertEquals("value4", map.get("test4"));
-        //虽然redis没有 但是外部存储有 可以走loader拿到
+        // 虽然redis没有 但是外部存储有 可以走loader拿到
         assertEquals("value", map.get("notExistsInRedis"));
         // 传true redis的也会被修改
         outStorage.put("test5", "value5");
@@ -107,11 +99,6 @@ class RedissonMapTest {
         assertEquals("modify-3", map.get("test3"));
         assertEquals("value5", map.get("test5"));
         // 不管是true传false 外部存储新增的load的时候都会写到redis
-    }
-
-
-    void writerLoaderSampleASync() {
-        //其实只是顺序变了 write的时候先写redis 再异步调用writer
     }
 
 

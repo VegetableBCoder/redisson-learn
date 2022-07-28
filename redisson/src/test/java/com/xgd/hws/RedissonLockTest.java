@@ -45,6 +45,7 @@ public class RedissonLockTest {
     @Test
     void fairLock() throws InterruptedException {
         RedissonFairLock lock = (RedissonFairLock) redisson.getFairLock("test-fair-lock");
+        /** @see RedissonFairLock#tryLockInnerAsync */
         if (lock.tryLock(100, -1, TimeUnit.SECONDS)) {
             try {
                 Thread.sleep(60 * 1000);

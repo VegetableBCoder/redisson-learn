@@ -39,6 +39,7 @@ class ReadWriteLockTest {
             RReadWriteLock readWriteLock = redisson.getReadWriteLock(LOCK_NAME);
             RLock lock = readWriteLock.readLock();
             try {
+                // 走了覆盖父类的tryLockInnerAsync
                 boolean b = lock.tryLock(30, -1, TimeUnit.SECONDS);
                 if (b) {
                     System.out.println("Thread " + Thread.currentThread().getId() + " get read lock, time:" + System.currentTimeMillis() / 1000);

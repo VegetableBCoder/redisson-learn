@@ -108,7 +108,7 @@ public class RedissonFairLock extends RedissonLock implements RLock {
         }
 
         long currentTime = System.currentTimeMillis();
-        //第一次尝试 返回是否成功
+        /** @see RedissonLock#tryAcquireOnceAsync 只尝试一次就不需要ttl */
         if (command == RedisCommands.EVAL_NULL_BOOLEAN) {
             return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                     // remove stale threads
@@ -156,7 +156,7 @@ public class RedissonFairLock extends RedissonLock implements RLock {
                         //返回null
                         "return nil;" +
                     "end;" +
-                    //如果锁已经存在了 直接重入
+                    //如果锁已经是自己持有的 直接重入
                     "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
                         // 自增
                         "redis.call('hincrby', KEYS[1], ARGV[2], 1);" +
@@ -225,7 +225,7 @@ public class RedissonFairLock extends RedissonLock implements RLock {
                     "local timeout = redis.call('zscore', KEYS[3], ARGV[2]);" +
                     "if timeout ~= false then " +
                         // the real timeout is the timeout of the prior thread in the queue, but this is approximately correct, and avoids having to traverse the queue
-                        // 这里是用大致预估来避免遍历 超时时间点-等待时间-当前时间(最少等这么久 才尝试下一次获取锁)
+                        // 这里是用大致预估来避免遍历 超时时间点-等待时间-当前时间(等这么久之后 才尝试下一次获取锁)
                         "return timeout - tonumber(ARGV[3]) - tonumber(ARGV[4]);" +
                     "end;" +
                     //
