@@ -51,21 +51,29 @@ public class RedissonMapCacheTest {
     @Test
     void debug() throws InterruptedException {
         MapOptions<Object, Object> options = MapOptions.defaults();
-        LocalCachedMapOptions.defaults();
-        RedissonMapCache<String, String> map = (RedissonMapCache) redisson.getMapCache("test-key1", StringCodec.INSTANCE,
-            options);
+        RedissonMapCache<String, String> map = (RedissonMapCache) redisson.getMapCache("test-key1", StringCodec.INSTANCE);
+        map.setMaxSize(1000,EvictionMode.LFU);
         map.put("test-hkey1", "test-value1", 20, TimeUnit.SECONDS);
-        map.setMaxSize(1000);
+        map.put("test-hkey1", "test-value2", 20, TimeUnit.SECONDS);
+        map.put("test-hkey1", "test-value3", 20, TimeUnit.SECONDS);
+        map.put("test-hkey1", "test-value4", 20, TimeUnit.SECONDS);
         map.get("test-hkey1");
+        map.get("test-hkey1");
+        // 这个只考虑TTL
+        map.getWithTTLOnly("test-hkey1");
+        map.getWithTTLOnly("test-hkey1");
+        map.getWithTTLOnly("test-hkey1");
+        map.getWithTTLOnly("test-hkey1");
+
+
         RedissonMapCache<String, String> map2 = (RedissonMapCache) redisson.getMapCache("test-key2", StringCodec.INSTANCE,
             LocalCachedMapOptions.defaults());
-        // 可以指定timeout 30s过期,idle time, 10s也淘汰掉
         // put入口看这个
         // 可以指定淘汰算法 默认LRU,LRU,LFU
         map2.setMaxSize(1000, EvictionMode.LFU);
         map2.put("test-hkey2", "test-value2", 30, TimeUnit.SECONDS, 10, TimeUnit.SECONDS);
-        // get入口看这个(和redissonMap一样的)
-        map2.get("test-hkey2");
+        // get入口
+        map2.getWithTTLOnly("test-hkey2");
         Thread.sleep(10 * 1000);
     }
 
@@ -76,31 +84,7 @@ public class RedissonMapCacheTest {
     void listenerSample() throws InterruptedException, NoSuchFieldException, IllegalAccessException {
         Map<String, String> ourStorage = new HashMap<>();
         MapOptions<String, String> options = MapOptions.<String, String>defaults()
-            .writeMode(MapOptions.WriteMode.WRITE_THROUGH)
-            .loader(new MapLoader<String, String>() {
-                @Override
-                public String load(String key) {
-                    return ourStorage.get(key);
-                }
-
-                @Override
-                public Iterable<String> loadAllKeys() {
-                    return ourStorage.keySet();
-                }
-            })
-            .writer(new MapWriter<String, String>() {
-
-                @Override
-                public void write(Map<String, String> map) {
-                    // 这里可以用外部存储装一下 但是还得通过listener接受其他节点发布的
-                    ourStorage.putAll(map);
-                }
-
-                @Override
-                public void delete(Collection<String> keys) {
-                    ourStorage.keySet().removeAll(keys);
-                }
-            });
+            .writeMode(MapOptions.WriteMode.WRITE_THROUGH);
         RMapCache<String, String> mapCache = redisson.getMapCache("test-cache-listener", StringCodec.INSTANCE, options);
         mapCache.put("hkey1", "value1");
         mapCache.put("hkey2", "value2");

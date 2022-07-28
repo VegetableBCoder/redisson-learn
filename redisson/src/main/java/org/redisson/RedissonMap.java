@@ -1144,6 +1144,7 @@ public class RedissonMap<K, V> extends RedissonExpirable implements RMap<K, V> {
             return future;
         }
 
+
         long threadId = Thread.currentThread().getId();
         CompletionStage<V> f = future.thenCompose(res -> {
             // 没有取到

@@ -512,34 +512,40 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         return commandExecutor.evalWriteAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
             "local value = redis.call('hget', KEYS[1], ARGV[2]); "
                 + "if value == false then "
-                + "return nil; "
+                + "   return nil; "
                 + "end; "
                 + "local t, val = struct.unpack('dLc0', value); "
-                + "local expireDate = 92233720368547758; " +
-                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "local expireDate = 92233720368547758; "
+                //过期时间
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
                 + "if expireDateScore ~= false then "
-                + "expireDate = tonumber(expireDateScore) "
+                + "    expireDate = tonumber(expireDateScore) "
                 + "end; "
                 + "if t ~= 0 then "
-                + "local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
-                + "if expireIdle ~= false then "
-                + "if tonumber(expireIdle) > tonumber(ARGV[1]) then "
-                + "redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
+                // idle时间
+                + "    local expireIdle = redis.call('zscore', KEYS[3], ARGV[2]); "
+                + "    if expireIdle ~= false then "
+                + "        if tonumber(expireIdle) > tonumber(ARGV[1]) then "
+                               // 被访问了 更新访问时间
+                + "            redis.call('zadd', KEYS[3], t + tonumber(ARGV[1]), ARGV[2]); "
+                + "        end; "
+                            // 过期时间取较小值
+                + "        expireDate = math.min(expireDate, tonumber(expireIdle)) "
+                + "    end; "
                 + "end; "
-                + "expireDate = math.min(expireDate, tonumber(expireIdle)) "
-                + "end; "
-                + "end; "
+                // 过期了
                 + "if expireDate <= tonumber(ARGV[1]) then "
-                + "return nil; "
+                + "   return nil; "
                 + "end; "
                 + "local maxSize = tonumber(redis.call('hget', KEYS[5], 'max-size')); " +
                 "if maxSize ~= nil and maxSize ~= 0 then " +
-                "local mode = redis.call('hget', KEYS[5], 'mode'); " +
-                "if mode == false or mode == 'LRU' then " +
-                "redis.call('zadd', KEYS[4], tonumber(ARGV[1]), ARGV[2]); " +
-                "else " +
-                "redis.call('zincrby', KEYS[4], 1, ARGV[2]); " +
-                "end; " +
+                "     local mode = redis.call('hget', KEYS[5], 'mode'); " +
+                //根据淘汰算法记录访问时间/访问次数
+                "     if mode == false or mode == 'LRU' then " +
+                "         redis.call('zadd', KEYS[4], tonumber(ARGV[1]), ARGV[2]); " +
+                "     else " +
+                "         redis.call('zincrby', KEYS[4], 1, ARGV[2]); " +
+                "     end; " +
                 "end; "
                 + "return val; ",
             Arrays.asList(name, getTimeoutSetName(name), getIdleSetName(name), getLastAccessTimeSetName(name), getOptionsName(name)),
@@ -1334,16 +1340,17 @@ public class RedissonMapCache<K, V> extends RedissonMap<K, V> implements RMapCac
         return commandExecutor.evalReadAsync(name, codec, RedisCommands.EVAL_MAP_VALUE,
             "local value = redis.call('hget', KEYS[1], ARGV[2]); "
                 + "if value == false then "
-                + "return nil; "
+                + "    return nil; "
                 + "end; "
                 + "local t, val = struct.unpack('dLc0', value); "
-                + "local expireDate = 92233720368547758; " +
-                "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
+                + "local expireDate = 92233720368547758; "
+                // 过期时间检查
+                + "local expireDateScore = redis.call('zscore', KEYS[2], ARGV[2]); "
                 + "if expireDateScore ~= false then "
-                + "expireDate = tonumber(expireDateScore) "
+                + "   expireDate = tonumber(expireDateScore) "
                 + "end; "
                 + "if expireDate <= tonumber(ARGV[1]) then "
-                + "return nil; "
+                + "   return nil; "
                 + "end; "
                 + "return val; ",
             Arrays.asList(name, getTimeoutSetName(name)),
